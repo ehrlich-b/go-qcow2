@@ -103,7 +103,44 @@ func newImage(f *os.File, readOnly bool) (*Image, error) {
 	// Initialize L2 cache (default 32 entries = 2MB with 64KB clusters)
 	img.l2Cache = newL2Cache(32, int(img.clusterSize))
 
+	// Mark image dirty if opened for writing (v3 only)
+	if !readOnly && header.Version >= Version3 {
+		if err := img.markDirty(); err != nil {
+			return nil, fmt.Errorf("qcow2: failed to mark image dirty: %w", err)
+		}
+	}
+
 	return img, nil
+}
+
+// markDirty sets the dirty bit in the header.
+func (img *Image) markDirty() error {
+	if img.header.IncompatibleFeatures&IncompatDirtyBit != 0 {
+		return nil // Already dirty
+	}
+
+	img.header.IncompatibleFeatures |= IncompatDirtyBit
+	return img.writeHeader()
+}
+
+// clearDirty clears the dirty bit in the header.
+func (img *Image) clearDirty() error {
+	if img.header.IncompatibleFeatures&IncompatDirtyBit == 0 {
+		return nil // Already clean
+	}
+
+	img.header.IncompatibleFeatures &^= IncompatDirtyBit
+	return img.writeHeader()
+}
+
+// writeHeader writes the current header to disk.
+func (img *Image) writeHeader() error {
+	headerBytes := img.header.Encode()
+	_, err := img.file.WriteAt(headerBytes, 0)
+	if err != nil {
+		return err
+	}
+	return img.file.Sync()
 }
 
 // loadL1Table reads the entire L1 table into memory.
@@ -424,10 +461,20 @@ func (img *Image) Flush() error {
 }
 
 // Close closes the image file.
+// On clean close, the dirty bit is cleared.
 func (img *Image) Close() error {
 	if err := img.Flush(); err != nil {
 		return err
 	}
+
+	// Clear dirty bit on clean close (v3 only, RW only)
+	if !img.readOnly && img.header.Version >= Version3 {
+		if err := img.clearDirty(); err != nil {
+			// Log but don't fail - data is already flushed
+			// The image will just need repair on next open
+		}
+	}
+
 	if img.backing != nil {
 		if err := img.backing.Close(); err != nil {
 			return err
@@ -439,4 +486,10 @@ func (img *Image) Close() error {
 // Header returns the image header (read-only).
 func (img *Image) Header() Header {
 	return *img.header
+}
+
+// IsDirty returns true if the image is marked dirty.
+// A dirty image was not cleanly closed and may need repair.
+func (img *Image) IsDirty() bool {
+	return img.header.IsDirty()
 }
