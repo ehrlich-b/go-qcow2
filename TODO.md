@@ -209,11 +209,13 @@
 | io.ReaderAt/WriterAt | Essential | Simple | ✅ Done |
 | L2 cache (LRU) | Essential | Simple | ✅ Done |
 | Image creation | Essential | Simple | ✅ Done |
-| Refcount management | Essential | Hard | ⏳ Pending |
-| Backing files | High | Medium | ⏳ Pending |
+| Dirty/corrupt tracking | High | Simple | ✅ Done |
+| Zero cluster detection | Medium | Simple | ✅ Done |
+| Refcount reading | Essential | Medium | ✅ Done |
+| Backing files (read) | High | Medium | ✅ Done |
+| Backing files (COW write) | High | Medium | ⚠️ Partial |
+| Refcount updates | Essential | Hard | ⏳ Pending |
 | Lazy refcounts | High | Hard | ⏳ Pending |
-| Dirty/corrupt tracking | High | Simple | ⏳ Pending |
-| Zero clusters | Medium | Simple | ⏳ Pending |
 | Compression (read) | Medium | Medium | ⏳ Pending |
 | Internal snapshots | Medium | Hard | ⏳ Pending |
 | Header extensions | Medium | Simple | ⏳ Pending |
