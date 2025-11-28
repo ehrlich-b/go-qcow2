@@ -411,6 +411,95 @@ func TestDirtyBitTracking(t *testing.T) {
 	img3.Close()
 }
 
+func TestBackingFile(t *testing.T) {
+	dir := t.TempDir()
+	basePath := filepath.Join(dir, "base.qcow2")
+	overlayPath := filepath.Join(dir, "overlay.qcow2")
+
+	// Create base image and write some data
+	base, err := CreateSimple(basePath, 1024*1024)
+	if err != nil {
+		t.Fatalf("Create base failed: %v", err)
+	}
+
+	baseData := []byte("Hello from base image!")
+	if _, err := base.WriteAt(baseData, 0); err != nil {
+		t.Fatalf("WriteAt base failed: %v", err)
+	}
+	base.Close()
+
+	// Create overlay
+	overlay, err := CreateOverlay(overlayPath, basePath)
+	if err != nil {
+		t.Fatalf("CreateOverlay failed: %v", err)
+	}
+
+	// Check backing file is set
+	if !overlay.HasBackingFile() {
+		t.Error("Overlay should have backing file")
+	}
+
+	// Read should fall through to base
+	buf := make([]byte, len(baseData))
+	n, err := overlay.ReadAt(buf, 0)
+	if err != nil {
+		t.Fatalf("ReadAt from overlay failed: %v", err)
+	}
+	if n != len(baseData) {
+		t.Errorf("ReadAt n = %d, want %d", n, len(baseData))
+	}
+	if !bytes.Equal(buf, baseData) {
+		t.Errorf("ReadAt data mismatch: got %q, want %q", buf, baseData)
+	}
+
+	// Write to overlay at a DIFFERENT cluster (cluster size is 64KB by default)
+	// Using offset 100000 ensures we're in a different cluster than offset 0
+	overlayOffset := int64(100000)
+	overlayData := []byte("Hello from overlay!")
+	if _, err := overlay.WriteAt(overlayData, overlayOffset); err != nil {
+		t.Fatalf("WriteAt overlay failed: %v", err)
+	}
+
+	// Read overlay data
+	buf2 := make([]byte, len(overlayData))
+	if _, err := overlay.ReadAt(buf2, overlayOffset); err != nil {
+		t.Fatalf("ReadAt overlay data failed: %v", err)
+	}
+	if !bytes.Equal(buf2, overlayData) {
+		t.Errorf("Overlay data mismatch: got %q, want %q", buf2, overlayData)
+	}
+
+	// Original base data should still read correctly (different cluster)
+	buf3 := make([]byte, len(baseData))
+	if _, err := overlay.ReadAt(buf3, 0); err != nil {
+		t.Fatalf("ReadAt base data via overlay failed: %v", err)
+	}
+	if !bytes.Equal(buf3, baseData) {
+		t.Errorf("Base data via overlay mismatch: got %q, want %q", buf3, baseData)
+	}
+
+	overlay.Close()
+
+	// Verify base is unchanged
+	base2, err := OpenFile(basePath, os.O_RDONLY, 0)
+	if err != nil {
+		t.Fatalf("Reopen base failed: %v", err)
+	}
+	defer base2.Close()
+
+	buf4 := make([]byte, len(overlayData))
+	if _, err := base2.ReadAt(buf4, overlayOffset); err != nil {
+		t.Fatalf("ReadAt base at overlay offset failed: %v", err)
+	}
+	// Base should have zeros at overlayOffset
+	for i, b := range buf4 {
+		if b != 0 {
+			t.Errorf("Base should have zeros at offset %d, got byte %d at index %d", overlayOffset, b, i)
+			break
+		}
+	}
+}
+
 func TestRefcountReading(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.qcow2")

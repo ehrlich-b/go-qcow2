@@ -110,6 +110,11 @@ func newImage(f *os.File, readOnly bool) (*Image, error) {
 		}
 	}
 
+	// Open backing file if present
+	if err := img.openBackingFile(); err != nil {
+		return nil, err
+	}
+
 	return img, nil
 }
 

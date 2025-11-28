@@ -31,12 +31,13 @@
 - [ ] Free-space tracking via refcounts
 
 ### Backing Files (Medium - Very Common)
-- [ ] Parse backing file path from header
+- [x] Parse backing file path from header
 - [ ] Backing file format extension (0xe2792aca)
-- [ ] Open backing file chain recursively
-- [ ] Fall through to backing on unallocated read
-- [ ] Copy-on-write: copy from backing on write
-- [ ] Path resolution relative to child image
+- [x] Open backing file chain recursively
+- [x] Fall through to backing on unallocated read
+- [ ] **Copy-on-write: copy from backing on partial cluster write** (BUG: currently zeroes cluster on write)
+- [x] Path resolution relative to child image
+- [x] CreateOverlay helper function
 
 ### Lazy Refcounts (Hard - Common)
 - [ ] Detect `lazy_refcounts` compatible feature

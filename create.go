@@ -88,10 +88,21 @@ func Create(path string, opts CreateOptions) (*Image, error) {
 	// For simplicity, start with 1 cluster for refcount table
 	refcountTableClusters := uint32(1)
 
+	// Handle backing file
+	var backingFileOffset uint64
+	var backingFileSize uint32
+	if opts.BackingFile != "" {
+		// Backing file path goes right after the header
+		backingFileOffset = uint64(headerLength)
+		backingFileSize = uint32(len(opts.BackingFile))
+	}
+
 	// Build header
 	header := &Header{
 		Magic:                 Magic,
 		Version:               opts.Version,
+		BackingFileOffset:     backingFileOffset,
+		BackingFileSize:       backingFileSize,
 		ClusterBits:           opts.ClusterBits,
 		Size:                  opts.Size,
 		L1Size:                uint32(l1Size),
@@ -118,6 +129,15 @@ func Create(path string, opts CreateOptions) (*Image, error) {
 		f.Close()
 		os.Remove(path)
 		return nil, fmt.Errorf("qcow2: failed to write header: %w", err)
+	}
+
+	// Write backing file path if specified
+	if opts.BackingFile != "" {
+		if _, err := f.WriteAt([]byte(opts.BackingFile), int64(backingFileOffset)); err != nil {
+			f.Close()
+			os.Remove(path)
+			return nil, fmt.Errorf("qcow2: failed to write backing file path: %w", err)
+		}
 	}
 
 	// Write L1 table (all zeros = unallocated)
@@ -184,4 +204,26 @@ func Create(path string, opts CreateOptions) (*Image, error) {
 //	img, err := qcow2.CreateSimple("disk.qcow2", 10*1024*1024*1024) // 10GB
 func CreateSimple(path string, size uint64) (*Image, error) {
 	return Create(path, CreateOptions{Size: size})
+}
+
+// CreateOverlay creates a new QCOW2 image backed by an existing image.
+// The new image starts empty and reads fall through to the backing file.
+// Writes go to the new image (copy-on-write).
+//
+//	overlay, err := qcow2.CreateOverlay("snapshot.qcow2", "base.qcow2")
+func CreateOverlay(path, backingFile string) (*Image, error) {
+	// Open backing file to get its size
+	backing, err := OpenFile(backingFile, os.O_RDONLY, 0)
+	if err != nil {
+		return nil, fmt.Errorf("qcow2: failed to open backing file: %w", err)
+	}
+	size := uint64(backing.Size())
+	clusterBits := backing.header.ClusterBits
+	backing.Close()
+
+	return Create(path, CreateOptions{
+		Size:        size,
+		ClusterBits: clusterBits,
+		BackingFile: backingFile,
+	})
 }
