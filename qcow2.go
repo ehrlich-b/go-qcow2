@@ -15,11 +15,11 @@ type Image struct {
 	header *Header
 
 	// Derived values cached for performance
-	clusterSize  uint64
-	clusterBits  uint32
-	l2Entries    uint64
-	l2Bits       uint32 // log2(l2Entries)
-	offsetMask   uint64 // Mask for offset within cluster
+	clusterSize uint64
+	clusterBits uint32
+	l2Entries   uint64
+	l2Bits      uint32 // log2(l2Entries)
+	offsetMask  uint64 // Mask for offset within cluster
 
 	// L1 table - loaded entirely into memory (typically small)
 	l1Table []byte
@@ -295,9 +295,9 @@ type clusterType int
 
 const (
 	clusterUnallocated clusterType = iota
-	clusterZero                     // All zeros (no backing storage needed)
-	clusterNormal                   // Normal allocated cluster
-	clusterCompressed               // Compressed cluster (not yet supported)
+	clusterZero                    // All zeros (no backing storage needed)
+	clusterNormal                  // Normal allocated cluster
+	clusterCompressed              // Compressed cluster (not yet supported)
 )
 
 // clusterInfo contains information about a cluster's location and type

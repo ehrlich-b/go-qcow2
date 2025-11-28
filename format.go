@@ -39,11 +39,11 @@ const (
 
 // Incompatible feature bits (must understand to open)
 const (
-	IncompatDirtyBit      = 1 << 0 // Image needs repair
-	IncompatCorruptBit    = 1 << 1 // Image is corrupt
-	IncompatExternalData  = 1 << 2 // Data in external file
-	IncompatCompression   = 1 << 3 // Compression type in header
-	IncompatExtendedL2    = 1 << 4 // Extended L2 entries
+	IncompatDirtyBit     = 1 << 0 // Image needs repair
+	IncompatCorruptBit   = 1 << 1 // Image is corrupt
+	IncompatExternalData = 1 << 2 // Data in external file
+	IncompatCompression  = 1 << 3 // Compression type in header
+	IncompatExtendedL2   = 1 << 4 // Extended L2 entries
 )
 
 // Compatible feature bits (can ignore if unknown)
@@ -53,16 +53,16 @@ const (
 
 // Autoclear feature bits (clear on open for RW)
 const (
-	AutoclearBitmaps       = 1 << 0
-	AutoclearRawExternal   = 1 << 1
+	AutoclearBitmaps     = 1 << 0
+	AutoclearRawExternal = 1 << 1
 )
 
 // L2 entry flags (in the high bits of the 64-bit entry)
 const (
-	L2EntryCompressed    = uint64(1) << 62
-	L2EntryCopied        = uint64(1) << 63 // Refcount is exactly 1
-	L2EntryOffsetMask    = (uint64(1) << 62) - 1 - 0x1ff // Bits 9-61
-	L2EntryZeroFlag      = uint64(1) << 0 // Standard cluster - all zeros
+	L2EntryCompressed = uint64(1) << 62
+	L2EntryCopied     = uint64(1) << 63               // Refcount is exactly 1
+	L2EntryOffsetMask = (uint64(1) << 62) - 1 - 0x1ff // Bits 9-61
+	L2EntryZeroFlag   = uint64(1) << 0                // Standard cluster - all zeros
 )
 
 // L1 entry flags

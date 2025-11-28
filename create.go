@@ -78,9 +78,9 @@ func Create(path string, opts CreateOptions) (*Image, error) {
 		headerLength = HeaderSizeV2
 	}
 
-	l1TableOffset := clusterSize                    // Cluster 1
-	refcountTableOffset := clusterSize * 2          // Cluster 2
-	firstRefcountBlockOffset := clusterSize * 3     // Cluster 3
+	l1TableOffset := clusterSize                // Cluster 1
+	refcountTableOffset := clusterSize * 2      // Cluster 2
+	firstRefcountBlockOffset := clusterSize * 3 // Cluster 3
 
 	// Calculate refcount table size
 	// With 16-bit refcounts and 64KB clusters, one refcount block covers:

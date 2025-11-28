@@ -411,6 +411,48 @@ func TestDirtyBitTracking(t *testing.T) {
 	img3.Close()
 }
 
+func TestRefcountReading(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.qcow2")
+
+	// Create an image
+	img, err := CreateSimple(path, 1024*1024)
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+
+	// Get refcount info
+	info, err := img.GetRefcountInfo()
+	if err != nil {
+		t.Fatalf("GetRefcountInfo failed: %v", err)
+	}
+
+	// Default is 16-bit refcounts
+	if info.RefcountBits != 16 {
+		t.Errorf("RefcountBits = %d, want 16", info.RefcountBits)
+	}
+
+	// Check that header cluster has refcount 1
+	refcount, err := img.ClusterRefcount(0)
+	if err != nil {
+		t.Fatalf("ClusterRefcount(0) failed: %v", err)
+	}
+	if refcount != 1 {
+		t.Errorf("Header cluster refcount = %d, want 1", refcount)
+	}
+
+	// Write some data to allocate a new cluster
+	data := make([]byte, 4096)
+	for i := range data {
+		data[i] = byte(i)
+	}
+	if _, err := img.WriteAt(data, 0); err != nil {
+		t.Fatalf("WriteAt failed: %v", err)
+	}
+
+	img.Close()
+}
+
 func TestReadOnly(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.qcow2")
