@@ -35,7 +35,7 @@
 - [ ] Backing file format extension (0xe2792aca)
 - [x] Open backing file chain recursively
 - [x] Fall through to backing on unallocated read
-- [ ] **Copy-on-write: copy from backing on partial cluster write** (BUG: currently zeroes cluster on write)
+- [x] Copy-on-write: copy from backing on partial cluster write
 - [x] Path resolution relative to child image
 - [x] CreateOverlay helper function
 
@@ -213,7 +213,7 @@
 | Zero cluster detection | Medium | Simple | ✅ Done |
 | Refcount reading | Essential | Medium | ✅ Done |
 | Backing files (read) | High | Medium | ✅ Done |
-| Backing files (COW write) | High | Medium | ⚠️ Partial |
+| Backing files (COW write) | High | Medium | ✅ Done |
 | Refcount updates | Essential | Hard | ⏳ Pending |
 | Lazy refcounts | High | Hard | ⏳ Pending |
 | Compression (read) | Medium | Medium | ⏳ Pending |

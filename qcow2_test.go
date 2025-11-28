@@ -452,9 +452,9 @@ func TestBackingFile(t *testing.T) {
 		t.Errorf("ReadAt data mismatch: got %q, want %q", buf, baseData)
 	}
 
-	// Write to overlay at a DIFFERENT cluster (cluster size is 64KB by default)
-	// Using offset 100000 ensures we're in a different cluster than offset 0
-	overlayOffset := int64(100000)
+	// Write to overlay IN THE SAME CLUSTER as base data (test COW)
+	// Offset 1000 is in the same 64KB cluster as offset 0
+	overlayOffset := int64(1000)
 	overlayData := []byte("Hello from overlay!")
 	if _, err := overlay.WriteAt(overlayData, overlayOffset); err != nil {
 		t.Fatalf("WriteAt overlay failed: %v", err)
@@ -469,7 +469,7 @@ func TestBackingFile(t *testing.T) {
 		t.Errorf("Overlay data mismatch: got %q, want %q", buf2, overlayData)
 	}
 
-	// Original base data should still read correctly (different cluster)
+	// Original base data should still read correctly (COW preserved it)
 	buf3 := make([]byte, len(baseData))
 	if _, err := overlay.ReadAt(buf3, 0); err != nil {
 		t.Fatalf("ReadAt base data via overlay failed: %v", err)
@@ -491,7 +491,7 @@ func TestBackingFile(t *testing.T) {
 	if _, err := base2.ReadAt(buf4, overlayOffset); err != nil {
 		t.Fatalf("ReadAt base at overlay offset failed: %v", err)
 	}
-	// Base should have zeros at overlayOffset
+	// Base should have zeros at overlayOffset (we only wrote to overlay)
 	for i, b := range buf4 {
 		if b != 0 {
 			t.Errorf("Base should have zeros at offset %d, got byte %d at index %d", overlayOffset, b, i)

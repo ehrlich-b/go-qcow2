@@ -448,6 +448,23 @@ func (img *Image) getClusterForWrite(virtOff uint64) (uint64, error) {
 			return 0, err
 		}
 
+		// COW: If we have a backing file, copy the cluster data first
+		if img.backing != nil {
+			clusterStart := virtOff & ^img.offsetMask // Align to cluster boundary
+			clusterData := make([]byte, img.clusterSize)
+
+			// Read from backing file (may be zeros if unallocated there too)
+			_, err := img.backing.ReadAt(clusterData, int64(clusterStart))
+			if err != nil && err != io.EOF {
+				return 0, fmt.Errorf("qcow2: COW read from backing failed: %w", err)
+			}
+
+			// Write the backing data to our new cluster
+			if _, err := img.file.WriteAt(clusterData, int64(physOff)); err != nil {
+				return 0, fmt.Errorf("qcow2: COW write failed: %w", err)
+			}
+		}
+
 		// Update L2 entry with COPIED flag
 		newL2Entry := physOff | L2EntryCopied
 		binary.BigEndian.PutUint64(l2Table[l2Index*8:], newL2Entry)
