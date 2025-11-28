@@ -28,6 +28,9 @@ type Image struct {
 	// L2 cache - keeps recently used L2 tables in memory
 	l2Cache *l2Cache
 
+	// Compressed cluster cache - keeps decompressed clusters
+	compressedCache *compressedClusterCache
+
 	// Refcount table offset cache
 	refcountTable     []byte
 	refcountTableLock sync.RWMutex
@@ -102,6 +105,9 @@ func newImage(f *os.File, readOnly bool) (*Image, error) {
 
 	// Initialize L2 cache (default 32 entries = 2MB with 64KB clusters)
 	img.l2Cache = newL2Cache(32, int(img.clusterSize))
+
+	// Initialize compressed cluster cache (default 16 entries)
+	img.compressedCache = newCompressedClusterCache(16, int(img.clusterSize))
 
 	// Mark image dirty if opened for writing (v3 only)
 	if !readOnly && header.Version >= Version3 {
@@ -235,7 +241,24 @@ func (img *Image) ReadAt(p []byte, off int64) (n int, err error) {
 			}
 
 		case clusterCompressed:
-			return n, fmt.Errorf("qcow2: compressed clusters not yet supported")
+			// Get decompressed cluster data (from cache or decompress)
+			clusterStart := uint64(off) & ^img.offsetMask
+			cacheKey := info.l2Entry // Use L2 entry as cache key
+
+			decompressed := img.compressedCache.get(cacheKey)
+			if decompressed == nil {
+				var err error
+				decompressed, err = img.decompressCluster(info.l2Entry)
+				if err != nil {
+					return n, err
+				}
+				img.compressedCache.put(cacheKey, decompressed)
+			}
+
+			// Read from decompressed data
+			clusterOff := uint64(off) - clusterStart
+			copy(p[:toRead], decompressed[clusterOff:clusterOff+toRead])
+			n += int(toRead)
 		}
 
 		p = p[toRead:]
@@ -309,6 +332,7 @@ const (
 type clusterInfo struct {
 	ctype   clusterType
 	physOff uint64 // Physical offset (0 for unallocated/zero)
+	l2Entry uint64 // Raw L2 entry (needed for compressed clusters)
 }
 
 // translate converts a virtual offset to cluster information.
@@ -342,9 +366,12 @@ func (img *Image) translate(virtOff uint64) (clusterInfo, error) {
 	// Read L2 entry
 	l2Entry := binary.BigEndian.Uint64(l2Table[l2Index*8:])
 
-	// Check if compressed (we don't support this yet)
+	// Check if compressed
 	if l2Entry&L2EntryCompressed != 0 {
-		return clusterInfo{}, fmt.Errorf("qcow2: compressed clusters not yet supported")
+		return clusterInfo{
+			ctype:   clusterCompressed,
+			l2Entry: l2Entry,
+		}, nil
 	}
 
 	// Check for zero cluster (bit 0 set)

@@ -71,9 +71,9 @@
 - [ ] QCOW2_CLUSTER_ZERO_PLAIN vs ZERO_ALLOC
 
 ### Compression - Reading (Medium - Common)
-- [ ] Detect compressed L2 entries (bit 62)
-- [ ] Parse compressed cluster offset/size
-- [ ] Deflate (zlib) decompression
+- [x] Detect compressed L2 entries (bit 62)
+- [x] Parse compressed cluster offset/size
+- [x] Deflate decompression
 - [ ] Zstd decompression
 - [ ] Handle compression type field (byte 104)
 
@@ -216,7 +216,7 @@
 | Backing files (COW write) | High | Medium | ✅ Done |
 | Refcount updates | Essential | Hard | ⏳ Pending |
 | Lazy refcounts | High | Hard | ⏳ Pending |
-| Compression (read) | Medium | Medium | ⏳ Pending |
+| Compression (read) | Medium | Medium | ✅ Done (deflate) |
 | Internal snapshots | Medium | Hard | ⏳ Pending |
 | Header extensions | Medium | Simple | ⏳ Pending |
 | Compression (write) | Low | Medium | ⏳ Pending |
