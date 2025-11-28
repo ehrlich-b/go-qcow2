@@ -191,14 +191,30 @@ func (img *Image) ReadAt(p []byte, off int64) (n int, err error) {
 			toRead = uint64(len(p))
 		}
 
-		// Translate virtual offset to physical offset
-		physOff, err := img.translate(uint64(off))
+		// Translate virtual offset to cluster info
+		info, err := img.translate(uint64(off))
 		if err != nil {
 			return n, err
 		}
 
-		if physOff == 0 {
-			// Unallocated cluster - read zeros or from backing file
+		switch info.ctype {
+		case clusterNormal:
+			// Read from allocated cluster
+			read, err := img.file.ReadAt(p[:toRead], int64(info.physOff))
+			n += read
+			if err != nil {
+				return n, err
+			}
+
+		case clusterZero:
+			// Zero cluster - return zeros without disk I/O
+			for i := uint64(0); i < toRead; i++ {
+				p[i] = 0
+			}
+			n += int(toRead)
+
+		case clusterUnallocated:
+			// Unallocated cluster - read from backing file or return zeros
 			if img.backing != nil {
 				read, err := img.backing.ReadAt(p[:toRead], off)
 				n += read
@@ -212,13 +228,9 @@ func (img *Image) ReadAt(p []byte, off int64) (n int, err error) {
 				}
 				n += int(toRead)
 			}
-		} else {
-			// Read from allocated cluster
-			read, err := img.file.ReadAt(p[:toRead], int64(physOff))
-			n += read
-			if err != nil {
-				return n, err
-			}
+
+		case clusterCompressed:
+			return n, fmt.Errorf("qcow2: compressed clusters not yet supported")
 		}
 
 		p = p[toRead:]
@@ -278,16 +290,31 @@ func (img *Image) WriteAt(p []byte, off int64) (n int, err error) {
 	return n, nil
 }
 
-// translate converts a virtual offset to a physical offset.
-// Returns 0 if the cluster is not allocated.
-func (img *Image) translate(virtOff uint64) (uint64, error) {
+// clusterType represents the type of a cluster
+type clusterType int
+
+const (
+	clusterUnallocated clusterType = iota
+	clusterZero                     // All zeros (no backing storage needed)
+	clusterNormal                   // Normal allocated cluster
+	clusterCompressed               // Compressed cluster (not yet supported)
+)
+
+// clusterInfo contains information about a cluster's location and type
+type clusterInfo struct {
+	ctype   clusterType
+	physOff uint64 // Physical offset (0 for unallocated/zero)
+}
+
+// translate converts a virtual offset to cluster information.
+func (img *Image) translate(virtOff uint64) (clusterInfo, error) {
 	// Calculate L1 and L2 indices
 	l2Index := (virtOff >> img.clusterBits) & (img.l2Entries - 1)
 	l1Index := virtOff >> (img.clusterBits + img.l2Bits)
 
 	// Check L1 bounds
 	if l1Index >= uint64(img.header.L1Size) {
-		return 0, nil // Unallocated
+		return clusterInfo{ctype: clusterUnallocated}, nil
 	}
 
 	// Read L1 entry
@@ -298,13 +325,13 @@ func (img *Image) translate(virtOff uint64) (uint64, error) {
 	// Extract L2 table offset
 	l2TableOff := l1Entry & L1EntryOffsetMask
 	if l2TableOff == 0 {
-		return 0, nil // L2 table not allocated
+		return clusterInfo{ctype: clusterUnallocated}, nil
 	}
 
 	// Get L2 table (from cache or disk)
 	l2Table, err := img.getL2Table(l2TableOff)
 	if err != nil {
-		return 0, err
+		return clusterInfo{}, err
 	}
 
 	// Read L2 entry
@@ -312,17 +339,25 @@ func (img *Image) translate(virtOff uint64) (uint64, error) {
 
 	// Check if compressed (we don't support this yet)
 	if l2Entry&L2EntryCompressed != 0 {
-		return 0, fmt.Errorf("qcow2: compressed clusters not yet supported")
+		return clusterInfo{}, fmt.Errorf("qcow2: compressed clusters not yet supported")
+	}
+
+	// Check for zero cluster (bit 0 set)
+	if l2Entry&L2EntryZeroFlag != 0 {
+		return clusterInfo{ctype: clusterZero}, nil
 	}
 
 	// Extract physical offset
 	physOff := l2Entry & L2EntryOffsetMask
 	if physOff == 0 {
-		return 0, nil // Unallocated
+		return clusterInfo{ctype: clusterUnallocated}, nil
 	}
 
 	// Add intra-cluster offset
-	return physOff + (virtOff & img.offsetMask), nil
+	return clusterInfo{
+		ctype:   clusterNormal,
+		physOff: physOff + (virtOff & img.offsetMask),
+	}, nil
 }
 
 // getL2Table retrieves an L2 table, using cache when possible.
