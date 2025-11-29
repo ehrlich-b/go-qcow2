@@ -532,7 +532,7 @@ func (img *Image) getL2Table(offset uint64) ([]byte, error) {
 }
 
 // getOrAllocateL2Table returns the offset of the L2 table for the given L1 index,
-// allocating a new L2 table if necessary.
+// allocating a new L2 table if necessary, or COW'ing a shared L2 table.
 func (img *Image) getOrAllocateL2Table(l1Index uint64) (uint64, error) {
 	// Ensure L1 table is large enough
 	if l1Index >= uint64(img.header.L1Size) {
@@ -544,12 +544,75 @@ func (img *Image) getOrAllocateL2Table(l1Index uint64) (uint64, error) {
 
 	l1Entry := binary.BigEndian.Uint64(img.l1Table[l1Index*8:])
 	l2TableOff := l1Entry & L1EntryOffsetMask
+	isCopied := l1Entry&L1EntryCopied != 0
 
 	if l2TableOff != 0 {
+		// L2 table exists - check if we need to COW it
+		if !isCopied {
+			// COPIED flag not set - L2 table may be shared
+			refcount, err := img.getRefcount(l2TableOff)
+			if err != nil {
+				return 0, fmt.Errorf("qcow2: failed to get L2 table refcount: %w", err)
+			}
+
+			if refcount > 1 {
+				// L2 table is shared - need to COW
+				newL2TableOff, err := img.allocateCluster()
+				if err != nil {
+					return 0, fmt.Errorf("qcow2: failed to allocate L2 table for COW: %w", err)
+				}
+
+				// Copy L2 table content
+				l2Data := make([]byte, img.clusterSize)
+				if _, err := img.file.ReadAt(l2Data, int64(l2TableOff)); err != nil {
+					return 0, fmt.Errorf("qcow2: failed to read L2 table for COW: %w", err)
+				}
+				if _, err := img.file.WriteAt(l2Data, int64(newL2TableOff)); err != nil {
+					return 0, fmt.Errorf("qcow2: failed to write L2 table COW: %w", err)
+				}
+
+				// Decrement refcount for old L2 table
+				if err := img.decrementRefcount(l2TableOff); err != nil {
+					return 0, fmt.Errorf("qcow2: failed to decrement old L2 table refcount: %w", err)
+				}
+
+				// Barrier: ensure L2 table is on disk before L1 points to it
+				if err := img.metadataBarrier(); err != nil {
+					return 0, fmt.Errorf("qcow2: L2 table COW barrier failed: %w", err)
+				}
+
+				// Update L1 entry to point to new L2 table with COPIED flag
+				newL1Entry := newL2TableOff | L1EntryCopied
+				binary.BigEndian.PutUint64(img.l1Table[l1Index*8:], newL1Entry)
+
+				// Write L1 entry to disk
+				if _, err := img.file.WriteAt(img.l1Table[l1Index*8:l1Index*8+8],
+					int64(img.header.L1TableOffset+l1Index*8)); err != nil {
+					return 0, err
+				}
+
+				// Invalidate old L2 table from cache
+				img.l2Cache.invalidate(l2TableOff)
+
+				// Update cache with new L2 table
+				img.l2Cache.put(newL2TableOff, l2Data)
+
+				return newL2TableOff, nil
+			}
+
+			// Refcount is 1 - safe to modify, just set COPIED flag
+			newL1Entry := l2TableOff | L1EntryCopied
+			binary.BigEndian.PutUint64(img.l1Table[l1Index*8:], newL1Entry)
+			if _, err := img.file.WriteAt(img.l1Table[l1Index*8:l1Index*8+8],
+				int64(img.header.L1TableOffset+l1Index*8)); err != nil {
+				return 0, err
+			}
+		}
+
 		return l2TableOff, nil
 	}
 
-	// Need to allocate L2 table
+	// Need to allocate new L2 table
 	var err error
 	l2TableOff, err = img.allocateCluster()
 	if err != nil {
@@ -588,7 +651,7 @@ func (img *Image) getOrAllocateL2Table(l1Index uint64) (uint64, error) {
 }
 
 // getClusterForWrite returns the physical offset for writing.
-// Allocates a new cluster if needed.
+// Allocates a new cluster if needed, or performs COW if the cluster is shared.
 func (img *Image) getClusterForWrite(virtOff uint64) (uint64, error) {
 	// Calculate L1 and L2 indices
 	l2Index := (virtOff >> img.clusterBits) & (img.l2Entries - 1)
@@ -609,16 +672,61 @@ func (img *Image) getClusterForWrite(virtOff uint64) (uint64, error) {
 	// Check L2 entry
 	l2Entry := binary.BigEndian.Uint64(l2Table[l2Index*8:])
 	physOff := l2Entry & L2EntryOffsetMask
+	isCopied := l2Entry&L2EntryCopied != 0
 
-	if physOff == 0 {
-		// Allocate data cluster
+	// Check if we need to allocate or COW
+	needsAlloc := physOff == 0
+	needsCOW := false
+
+	if physOff != 0 && !isCopied {
+		// COPIED flag is not set - cluster may be shared
+		// Check refcount to decide if we need COW
+		refcount, err := img.getRefcount(physOff)
+		if err != nil {
+			return 0, fmt.Errorf("qcow2: failed to get refcount for COW check: %w", err)
+		}
+		if refcount > 1 {
+			needsCOW = true
+		} else if refcount == 1 {
+			// Refcount is 1, we can safely write and set COPIED flag
+			newL2Entry := physOff | L2EntryCopied
+			binary.BigEndian.PutUint64(l2Table[l2Index*8:], newL2Entry)
+			if _, err := img.file.WriteAt(l2Table[l2Index*8:l2Index*8+8],
+				int64(l2TableOff+l2Index*8)); err != nil {
+				return 0, err
+			}
+			img.l2Cache.put(l2TableOff, l2Table)
+		}
+	}
+
+	if needsAlloc || needsCOW {
+		oldPhysOff := physOff
+
+		// Allocate new data cluster
 		physOff, err = img.allocateCluster()
 		if err != nil {
 			return 0, err
 		}
 
-		// COW: If we have a backing file, copy the cluster data first
-		if img.backing != nil {
+		// COW: Copy existing data to new cluster
+		if needsCOW {
+			// Read from old cluster
+			clusterData := make([]byte, img.clusterSize)
+			if _, err := img.file.ReadAt(clusterData, int64(oldPhysOff)); err != nil {
+				return 0, fmt.Errorf("qcow2: COW read failed: %w", err)
+			}
+
+			// Write to new cluster
+			if _, err := img.file.WriteAt(clusterData, int64(physOff)); err != nil {
+				return 0, fmt.Errorf("qcow2: COW write failed: %w", err)
+			}
+
+			// Decrement refcount for old cluster (now one less reference)
+			if err := img.decrementRefcount(oldPhysOff); err != nil {
+				return 0, fmt.Errorf("qcow2: failed to decrement old cluster refcount: %w", err)
+			}
+		} else if img.backing != nil {
+			// No existing data but have backing file - copy from backing
 			clusterStart := virtOff & ^img.offsetMask // Align to cluster boundary
 			clusterData := make([]byte, img.clusterSize)
 
@@ -632,11 +740,11 @@ func (img *Image) getClusterForWrite(virtOff uint64) (uint64, error) {
 			if _, err := img.file.WriteAt(clusterData, int64(physOff)); err != nil {
 				return 0, fmt.Errorf("qcow2: COW write failed: %w", err)
 			}
+		}
 
-			// Barrier: ensure COW data is on disk before L2 points to it
-			if err := img.dataBarrier(); err != nil {
-				return 0, fmt.Errorf("qcow2: COW data barrier failed: %w", err)
-			}
+		// Barrier: ensure data is on disk before L2 points to it
+		if err := img.dataBarrier(); err != nil {
+			return 0, fmt.Errorf("qcow2: data barrier failed: %w", err)
 		}
 
 		// Update L2 entry with COPIED flag

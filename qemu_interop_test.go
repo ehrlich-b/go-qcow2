@@ -822,3 +822,156 @@ func TestQemuInterop_ReadAtSnapshot(t *testing.T) {
 		}
 	}
 }
+
+// TestQemuInterop_CreateSnapshot tests that snapshots created by go-qcow2 are readable by QEMU.
+func TestQemuInterop_CreateSnapshot(t *testing.T) {
+	t.Parallel()
+	testutil.RequireQemu(t)
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.qcow2")
+
+	// Create image with go-qcow2
+	img, err := CreateSimple(path, 64*1024*1024) // 64MB
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+
+	// Write pattern 0xAA to first cluster
+	pattern1 := bytes.Repeat([]byte{0xAA}, 4096)
+	if _, err := img.WriteAt(pattern1, 0); err != nil {
+		img.Close()
+		t.Fatalf("WriteAt failed: %v", err)
+	}
+
+	// Create first snapshot with go-qcow2
+	snap1, err := img.CreateSnapshot("snap1")
+	if err != nil {
+		img.Close()
+		t.Fatalf("CreateSnapshot(snap1) failed: %v", err)
+	}
+	t.Logf("Created snapshot snap1: ID=%s, L1Offset=0x%x", snap1.ID, snap1.L1TableOffset)
+
+	// Write pattern 0xBB to first cluster (overwrite)
+	pattern2 := bytes.Repeat([]byte{0xBB}, 4096)
+	if _, err := img.WriteAt(pattern2, 0); err != nil {
+		img.Close()
+		t.Fatalf("WriteAt failed: %v", err)
+	}
+
+	// Create second snapshot
+	snap2, err := img.CreateSnapshot("snap2")
+	if err != nil {
+		img.Close()
+		t.Fatalf("CreateSnapshot(snap2) failed: %v", err)
+	}
+	t.Logf("Created snapshot snap2: ID=%s, L1Offset=0x%x", snap2.ID, snap2.L1TableOffset)
+
+	// Write pattern 0xCC to first cluster (current state)
+	pattern3 := bytes.Repeat([]byte{0xCC}, 4096)
+	if _, err := img.WriteAt(pattern3, 0); err != nil {
+		img.Close()
+		t.Fatalf("WriteAt failed: %v", err)
+	}
+
+	// Flush and close
+	img.Flush()
+	img.Close()
+
+	// Run qemu-img check to verify image integrity
+	checkResult := testutil.RunQemuImg(t, "check", path)
+	if !checkResult.IsSuccess() {
+		t.Errorf("qemu-img check failed: %s", checkResult.Stderr)
+	}
+
+	// Verify QEMU can see the snapshots
+	qemuSnaps := testutil.QemuListSnapshots(t, path)
+	if len(qemuSnaps) != 2 {
+		t.Fatalf("QEMU reports %d snapshots, want 2", len(qemuSnaps))
+	}
+
+	// Find our snapshots in QEMU's output
+	foundSnap1 := false
+	foundSnap2 := false
+	for _, snapInfo := range qemuSnaps {
+		name, ok := snapInfo["name"].(string)
+		if !ok {
+			continue
+		}
+		if name == "snap1" {
+			foundSnap1 = true
+		}
+		if name == "snap2" {
+			foundSnap2 = true
+		}
+	}
+	if !foundSnap1 {
+		t.Error("QEMU did not find snapshot 'snap1'")
+	}
+	if !foundSnap2 {
+		t.Error("QEMU did not find snapshot 'snap2'")
+	}
+
+	// Verify we can read the current state
+	if !testutil.QemuRead(t, path, 0xCC, 0, 4096) {
+		t.Error("Current state: expected 0xCC pattern")
+	}
+
+	// Verify we can read from snap1 using qemu-io
+	// Apply snap1 to read its data
+	// Note: We can't easily read snapshot data with qemu-io without applying it,
+	// so we verify by re-opening with go-qcow2 and using ReadAtSnapshot
+	img2, err := Open(path)
+	if err != nil {
+		t.Fatalf("Re-open failed: %v", err)
+	}
+	defer img2.Close()
+
+	// Verify our snapshots are still there
+	snaps := img2.Snapshots()
+	if len(snaps) != 2 {
+		t.Fatalf("After re-open: %d snapshots, want 2", len(snaps))
+	}
+
+	// Read from snap1 - should be 0xAA
+	snap1Ref := img2.FindSnapshot("snap1")
+	if snap1Ref == nil {
+		t.Fatal("FindSnapshot(snap1) returned nil after re-open")
+	}
+	buf := make([]byte, 4096)
+	if _, err := img2.ReadAtSnapshot(buf, 0, snap1Ref); err != nil {
+		t.Fatalf("ReadAtSnapshot(snap1) failed: %v", err)
+	}
+	for i, b := range buf {
+		if b != 0xAA {
+			t.Errorf("Snapshot snap1: byte %d = 0x%02X, want 0xAA", i, b)
+			break
+		}
+	}
+
+	// Read from snap2 - should be 0xBB
+	snap2Ref := img2.FindSnapshot("snap2")
+	if snap2Ref == nil {
+		t.Fatal("FindSnapshot(snap2) returned nil after re-open")
+	}
+	if _, err := img2.ReadAtSnapshot(buf, 0, snap2Ref); err != nil {
+		t.Fatalf("ReadAtSnapshot(snap2) failed: %v", err)
+	}
+	for i, b := range buf {
+		if b != 0xBB {
+			t.Errorf("Snapshot snap2: byte %d = 0x%02X, want 0xBB", i, b)
+			break
+		}
+	}
+
+	// Read current state - should be 0xCC
+	if _, err := img2.ReadAt(buf, 0); err != nil {
+		t.Fatalf("ReadAt(current) failed: %v", err)
+	}
+	for i, b := range buf {
+		if b != 0xCC {
+			t.Errorf("Current state: byte %d = 0x%02X, want 0xCC", i, b)
+			break
+		}
+	}
+}

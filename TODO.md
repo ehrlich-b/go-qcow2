@@ -87,7 +87,7 @@
 - [x] Parse snapshot table structure
 - [x] Snapshot directory entries (FindSnapshot, Snapshots)
 - [x] Read from specific snapshot (ReadAtSnapshot)
-- [ ] Create snapshot (copy L1 table, update refcounts)
+- [x] Create snapshot (copy L1 table, update refcounts, COW support)
 - [ ] Delete snapshot
 - [ ] Revert to snapshot
 

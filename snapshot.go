@@ -274,3 +274,307 @@ func (img *Image) translateWithL1(virtOff uint64, l1Table []byte) (clusterInfo, 
 		physOff: physOff + (virtOff & img.offsetMask),
 	}, nil
 }
+
+// serializeSnapshot encodes a snapshot to bytes for disk storage.
+// Returns the serialized bytes including padding to 8-byte boundary.
+func serializeSnapshot(snap *Snapshot) []byte {
+	idBytes := []byte(snap.ID)
+	nameBytes := []byte(snap.Name)
+	extraDataSize := uint32(len(snap.ExtraData))
+
+	// Calculate total size with 8-byte alignment
+	size := snapshotHeaderSize + int(extraDataSize) + len(idBytes) + len(nameBytes)
+	if size%8 != 0 {
+		size = ((size / 8) + 1) * 8
+	}
+
+	buf := make([]byte, size)
+
+	// Write fixed header
+	binary.BigEndian.PutUint64(buf[0:8], snap.L1TableOffset)
+	binary.BigEndian.PutUint32(buf[8:12], snap.L1Size)
+	binary.BigEndian.PutUint16(buf[12:14], uint16(len(idBytes)))
+	binary.BigEndian.PutUint16(buf[14:16], uint16(len(nameBytes)))
+	binary.BigEndian.PutUint32(buf[16:20], uint32(snap.Date.Unix()))
+	binary.BigEndian.PutUint32(buf[20:24], uint32(snap.Date.Nanosecond()))
+	binary.BigEndian.PutUint64(buf[24:32], snap.VMClock)
+	binary.BigEndian.PutUint32(buf[32:36], snap.VMStateSize)
+	binary.BigEndian.PutUint32(buf[36:40], extraDataSize)
+
+	// Write variable-length fields
+	pos := snapshotHeaderSize
+	if extraDataSize > 0 {
+		copy(buf[pos:], snap.ExtraData)
+		pos += int(extraDataSize)
+	}
+	copy(buf[pos:], idBytes)
+	pos += len(idBytes)
+	copy(buf[pos:], nameBytes)
+	// Remaining bytes are already zero (padding)
+
+	return buf
+}
+
+// CreateSnapshot creates a new internal snapshot with the given name.
+// The snapshot captures the current state of the image by copying the L1 table
+// and incrementing refcounts for all referenced clusters.
+func (img *Image) CreateSnapshot(name string) (*Snapshot, error) {
+	if img.readOnly {
+		return nil, fmt.Errorf("qcow2: cannot create snapshot on read-only image")
+	}
+
+	if name == "" {
+		return nil, fmt.Errorf("qcow2: snapshot name cannot be empty")
+	}
+
+	// Check for duplicate name
+	if img.FindSnapshot(name) != nil {
+		return nil, fmt.Errorf("qcow2: snapshot with name %q already exists", name)
+	}
+
+	// Generate unique ID (QEMU uses sequential numbers as strings)
+	id := fmt.Sprintf("%d", len(img.snapshots)+1)
+	// Ensure ID is unique
+	for img.FindSnapshot(id) != nil {
+		id = fmt.Sprintf("%d", len(img.snapshots)+100)
+	}
+
+	// Copy L1 table to new cluster(s)
+	img.l1Mu.Lock()
+	l1TableSize := uint64(img.header.L1Size) * 8
+	l1TableCopy := make([]byte, l1TableSize)
+	copy(l1TableCopy, img.l1Table)
+
+	// Clear COPIED flags in the snapshot's L1 table copy (shared clusters)
+	// and in the current image's L1 table (so writes trigger COW)
+	for i := uint64(0); i < uint64(img.header.L1Size); i++ {
+		entry := binary.BigEndian.Uint64(l1TableCopy[i*8:])
+		if entry != 0 && entry&L1EntryOffsetMask != 0 {
+			// Clear COPIED flag in snapshot's copy
+			entry &^= L1EntryCopied
+			binary.BigEndian.PutUint64(l1TableCopy[i*8:], entry)
+
+			// Clear COPIED flag in current image's L1 table
+			currentEntry := binary.BigEndian.Uint64(img.l1Table[i*8:])
+			currentEntry &^= L1EntryCopied
+			binary.BigEndian.PutUint64(img.l1Table[i*8:], currentEntry)
+		}
+	}
+
+	// Write updated current L1 table to disk (with COPIED flags cleared)
+	if _, err := img.file.WriteAt(img.l1Table, int64(img.header.L1TableOffset)); err != nil {
+		img.l1Mu.Unlock()
+		return nil, fmt.Errorf("qcow2: failed to update L1 table: %w", err)
+	}
+	img.l1Mu.Unlock()
+
+	// Allocate clusters for the new L1 table
+	l1Clusters := (l1TableSize + img.clusterSize - 1) / img.clusterSize
+	newL1Offset, err := img.allocateCluster()
+	if err != nil {
+		return nil, fmt.Errorf("qcow2: failed to allocate cluster for snapshot L1 table: %w", err)
+	}
+
+	// If L1 table spans multiple clusters, allocate the rest
+	for i := uint64(1); i < l1Clusters; i++ {
+		nextCluster, err := img.allocateCluster()
+		if err != nil {
+			return nil, fmt.Errorf("qcow2: failed to allocate cluster for snapshot L1 table: %w", err)
+		}
+		// Verify clusters are contiguous (simplification - QEMU does this too)
+		if nextCluster != newL1Offset+i*img.clusterSize {
+			return nil, fmt.Errorf("qcow2: non-contiguous cluster allocation for L1 table")
+		}
+	}
+
+	// Write the L1 table copy to disk (with COPIED flags cleared)
+	// Pad to cluster boundary
+	paddedL1 := make([]byte, l1Clusters*img.clusterSize)
+	copy(paddedL1, l1TableCopy)
+	if _, err := img.file.WriteAt(paddedL1, int64(newL1Offset)); err != nil {
+		return nil, fmt.Errorf("qcow2: failed to write snapshot L1 table: %w", err)
+	}
+
+	// Increment refcounts for all L2 tables and data clusters referenced by this snapshot
+	// Also clear COPIED flags in L2 tables
+	if err := img.incrementSnapshotRefcounts(l1TableCopy); err != nil {
+		return nil, fmt.Errorf("qcow2: failed to update refcounts for snapshot: %w", err)
+	}
+
+	// Build V3 extra data: vm_state_size_large (8 bytes) + disk_size (8 bytes)
+	var extraData []byte
+	if img.header.Version >= Version3 {
+		extraData = make([]byte, 16)
+		binary.BigEndian.PutUint64(extraData[0:8], 0)                  // vm_state_size_large
+		binary.BigEndian.PutUint64(extraData[8:16], img.header.Size)   // disk_size
+	}
+
+	// Create snapshot entry
+	snap := &Snapshot{
+		L1TableOffset: newL1Offset,
+		L1Size:        img.header.L1Size,
+		ID:            id,
+		Name:          name,
+		Date:          time.Now(),
+		VMClock:       0, // No VM state
+		VMStateSize:   0,
+		ExtraData:     extraData,
+	}
+
+	// Write new snapshot table
+	if err := img.writeSnapshotTable(snap); err != nil {
+		return nil, fmt.Errorf("qcow2: failed to write snapshot table: %w", err)
+	}
+
+	// Add to in-memory list
+	img.snapshots = append(img.snapshots, snap)
+
+	return snap, nil
+}
+
+// incrementSnapshotRefcounts increments refcounts for all L2 tables and data clusters
+// referenced by the given L1 table. This is called when creating a snapshot to ensure
+// clusters are not freed while still referenced by the snapshot.
+// It also clears COPIED flags in L2 tables since the clusters are now shared.
+func (img *Image) incrementSnapshotRefcounts(l1Table []byte) error {
+	l1Entries := uint64(len(l1Table)) / 8
+
+	for i := uint64(0); i < l1Entries; i++ {
+		l1Entry := binary.BigEndian.Uint64(l1Table[i*8:])
+		if l1Entry == 0 {
+			continue
+		}
+
+		l2Offset := l1Entry & L1EntryOffsetMask
+		if l2Offset == 0 {
+			continue
+		}
+
+		// Increment refcount for L2 table
+		if err := img.incrementRefcount(l2Offset); err != nil {
+			return fmt.Errorf("failed to increment L2 table refcount at 0x%x: %w", l2Offset, err)
+		}
+
+		// Read L2 table and process entries
+		l2Table, err := img.getL2Table(l2Offset)
+		if err != nil {
+			return fmt.Errorf("failed to read L2 table at 0x%x: %w", l2Offset, err)
+		}
+
+		// Make a copy of L2 table to modify
+		l2Modified := make([]byte, len(l2Table))
+		copy(l2Modified, l2Table)
+		needsWrite := false
+
+		for j := uint64(0); j < img.l2Entries; j++ {
+			l2Entry := binary.BigEndian.Uint64(l2Modified[j*8:])
+			if l2Entry == 0 {
+				continue
+			}
+
+			// Skip compressed clusters - they have special offset format
+			if l2Entry&L2EntryCompressed != 0 {
+				continue
+			}
+
+			// Skip zero clusters without allocation
+			if l2Entry&L2EntryZeroFlag != 0 && l2Entry&L2EntryOffsetMask == 0 {
+				continue
+			}
+
+			dataOffset := l2Entry & L2EntryOffsetMask
+			if dataOffset != 0 {
+				if err := img.incrementRefcount(dataOffset); err != nil {
+					return fmt.Errorf("failed to increment data cluster refcount at 0x%x: %w", dataOffset, err)
+				}
+
+				// Clear COPIED flag since this cluster is now shared
+				if l2Entry&L2EntryCopied != 0 {
+					l2Entry &^= L2EntryCopied
+					binary.BigEndian.PutUint64(l2Modified[j*8:], l2Entry)
+					needsWrite = true
+				}
+			}
+		}
+
+		// Write modified L2 table to disk if COPIED flags were cleared
+		if needsWrite {
+			if _, err := img.file.WriteAt(l2Modified, int64(l2Offset)); err != nil {
+				return fmt.Errorf("failed to write L2 table at 0x%x: %w", l2Offset, err)
+			}
+			// Update L2 cache
+			img.l2Cache.put(l2Offset, l2Modified)
+		}
+	}
+
+	return nil
+}
+
+// writeSnapshotTable writes the complete snapshot table with the new snapshot appended.
+// This allocates new cluster(s) for the snapshot table and updates the header.
+func (img *Image) writeSnapshotTable(newSnap *Snapshot) error {
+	// Serialize all existing snapshots plus the new one
+	var tableData []byte
+	for _, snap := range img.snapshots {
+		tableData = append(tableData, serializeSnapshot(snap)...)
+	}
+	tableData = append(tableData, serializeSnapshot(newSnap)...)
+
+	// Calculate clusters needed
+	tableClusters := (uint64(len(tableData)) + img.clusterSize - 1) / img.clusterSize
+
+	// Allocate clusters for the new snapshot table
+	newTableOffset, err := img.allocateCluster()
+	if err != nil {
+		return fmt.Errorf("failed to allocate cluster for snapshot table: %w", err)
+	}
+
+	// Allocate remaining clusters if needed
+	for i := uint64(1); i < tableClusters; i++ {
+		nextCluster, err := img.allocateCluster()
+		if err != nil {
+			return fmt.Errorf("failed to allocate cluster for snapshot table: %w", err)
+		}
+		if nextCluster != newTableOffset+i*img.clusterSize {
+			return fmt.Errorf("non-contiguous cluster allocation for snapshot table")
+		}
+	}
+
+	// Pad table data to cluster boundary
+	paddedTable := make([]byte, tableClusters*img.clusterSize)
+	copy(paddedTable, tableData)
+
+	// Write table to disk
+	if _, err := img.file.WriteAt(paddedTable, int64(newTableOffset)); err != nil {
+		return fmt.Errorf("failed to write snapshot table: %w", err)
+	}
+
+	// Decrement refcounts for old snapshot table clusters if present
+	if img.header.SnapshotsOffset != 0 && img.header.NbSnapshots > 0 {
+		// Calculate old table size
+		oldTableSize := uint64(0)
+		for _, snap := range img.snapshots {
+			oldTableSize += uint64(len(serializeSnapshot(snap)))
+		}
+		oldClusters := (oldTableSize + img.clusterSize - 1) / img.clusterSize
+		for i := uint64(0); i < oldClusters; i++ {
+			if err := img.decrementRefcount(img.header.SnapshotsOffset + i*img.clusterSize); err != nil {
+				// Log but don't fail - old table may not have proper refcounts
+			}
+		}
+	}
+
+	// Update header
+	img.header.SnapshotsOffset = newTableOffset
+	img.header.NbSnapshots = uint32(len(img.snapshots) + 1)
+
+	if err := img.writeHeader(); err != nil {
+		return fmt.Errorf("failed to write header: %w", err)
+	}
+
+	if err := img.file.Sync(); err != nil {
+		return fmt.Errorf("failed to sync: %w", err)
+	}
+
+	return nil
+}
