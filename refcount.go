@@ -5,50 +5,23 @@ import (
 	"fmt"
 )
 
-// refcountTable manages the two-level refcount structure.
-// Level 1: Refcount table (array of 64-bit offsets to refcount blocks)
-// Level 2: Refcount blocks (array of refcount entries)
-type refcountTable struct {
-	img *Image
-
-	// Refcount entry configuration
-	refcountBits    uint32 // Bits per refcount entry (1, 2, 4, 8, 16, 32, 64)
-	refcountBytes   uint32 // Bytes per refcount entry
-	entriesPerBlock uint64 // Number of refcount entries per block
-
-	// Cached refcount table (level 1)
-	table []byte
-}
-
 // loadRefcountTable loads the refcount table into memory.
+// The refcount table is a two-level structure:
+// - Level 1: Refcount table (array of 64-bit offsets to refcount blocks)
+// - Level 2: Refcount blocks (array of refcount entries)
 func (img *Image) loadRefcountTable() error {
 	if img.refcountTable != nil {
 		return nil // Already loaded
 	}
 
-	refcountBits := img.header.RefcountBits()
-	refcountBytes := refcountBits / 8
-	if refcountBytes == 0 {
-		refcountBytes = 1 // Minimum 1 byte for sub-byte refcounts
-	}
-
-	rt := &refcountTable{
-		img:             img,
-		refcountBits:    refcountBits,
-		refcountBytes:   refcountBytes,
-		entriesPerBlock: img.clusterSize / uint64(refcountBytes),
-	}
-
-	// Load refcount table
 	tableSize := uint64(img.header.RefcountTableClusters) * img.clusterSize
-	rt.table = make([]byte, tableSize)
+	img.refcountTable = make([]byte, tableSize)
 
-	_, err := img.file.ReadAt(rt.table, int64(img.header.RefcountTableOffset))
+	_, err := img.file.ReadAt(img.refcountTable, int64(img.header.RefcountTableOffset))
 	if err != nil {
 		return fmt.Errorf("qcow2: failed to read refcount table: %w", err)
 	}
 
-	img.refcountTable = rt.table
 	return nil
 }
 
@@ -84,11 +57,17 @@ func (img *Image) getRefcount(hostOffset uint64) (uint64, error) {
 		return 0, nil // Block not allocated, refcount is 0
 	}
 
-	// Read the refcount block
-	block := make([]byte, img.clusterSize)
-	_, err := img.file.ReadAt(block, int64(blockOffset))
-	if err != nil {
-		return 0, fmt.Errorf("qcow2: failed to read refcount block: %w", err)
+	// Check cache first
+	block := img.refcountBlockCache.get(blockOffset)
+	if block == nil {
+		// Cache miss - read from disk
+		block = make([]byte, img.clusterSize)
+		_, err := img.file.ReadAt(block, int64(blockOffset))
+		if err != nil {
+			return 0, fmt.Errorf("qcow2: failed to read refcount block: %w", err)
+		}
+		// Add to cache
+		img.refcountBlockCache.put(blockOffset, block)
 	}
 
 	// Read the specific refcount entry
@@ -253,11 +232,14 @@ func (img *Image) updateRefcount(hostOffset uint64, delta int64) error {
 		}
 	}
 
-	// Read the refcount block
-	block := make([]byte, img.clusterSize)
-	_, err := img.file.ReadAt(block, int64(blockOffset))
-	if err != nil {
-		return fmt.Errorf("qcow2: failed to read refcount block: %w", err)
+	// Check cache first, otherwise read from disk
+	block := img.refcountBlockCache.get(blockOffset)
+	if block == nil {
+		block = make([]byte, img.clusterSize)
+		_, err := img.file.ReadAt(block, int64(blockOffset))
+		if err != nil {
+			return fmt.Errorf("qcow2: failed to read refcount block: %w", err)
+		}
 	}
 
 	// Read current refcount
@@ -283,10 +265,13 @@ func (img *Image) updateRefcount(hostOffset uint64, delta int64) error {
 	writeRefcountEntry(block, refcountBlockIndex, refcountBits, newRefcount)
 
 	// Write block back to disk
-	_, err = img.file.WriteAt(block, int64(blockOffset))
+	_, err := img.file.WriteAt(block, int64(blockOffset))
 	if err != nil {
 		return fmt.Errorf("qcow2: failed to write refcount block: %w", err)
 	}
+
+	// Update cache
+	img.refcountBlockCache.put(blockOffset, block)
 
 	return nil
 }
@@ -363,6 +348,9 @@ func (img *Image) rebuildRefcounts() error {
 	if err := img.loadRefcountTable(); err != nil {
 		return err
 	}
+
+	// Clear refcount block cache since we're rebuilding everything
+	img.refcountBlockCache.clear()
 
 	// Get refcount configuration
 	refcountBits := img.header.RefcountBits()

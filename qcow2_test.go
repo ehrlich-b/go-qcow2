@@ -3,6 +3,8 @@ package qcow2
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -1656,4 +1658,55 @@ func TestWriteBarrierWithZeroCluster(t *testing.T) {
 			break
 		}
 	}
+}
+
+func TestBackingChainDepthLimit(t *testing.T) {
+	dir := t.TempDir()
+
+	// Create a chain that exceeds MaxBackingChainDepth
+	// We only need MaxBackingChainDepth+2 images to trigger the error:
+	// - base image (depth 0)
+	// - MaxBackingChainDepth overlays (depths 1 through MaxBackingChainDepth)
+	// - one more overlay that should fail (depth MaxBackingChainDepth+1)
+	chainLength := MaxBackingChainDepth + 2
+
+	// Create base image
+	basePath := filepath.Join(dir, "base.qcow2")
+	base, err := CreateSimple(basePath, 64*1024)
+	if err != nil {
+		t.Fatalf("Create base failed: %v", err)
+	}
+	base.Close()
+
+	// Create chain of overlays
+	prevPath := basePath
+	var paths []string
+	paths = append(paths, basePath)
+
+	for i := 1; i < chainLength; i++ {
+		overlayPath := filepath.Join(dir, fmt.Sprintf("overlay%d.qcow2", i))
+		overlay, err := CreateOverlay(overlayPath, prevPath)
+
+		if i <= MaxBackingChainDepth {
+			// These should succeed
+			if err != nil {
+				t.Fatalf("CreateOverlay %d failed unexpectedly: %v", i, err)
+			}
+			overlay.Close()
+			paths = append(paths, overlayPath)
+			prevPath = overlayPath
+		} else {
+			// This should fail with ErrBackingChainTooDeep
+			if err == nil {
+				overlay.Close()
+				t.Fatalf("CreateOverlay %d should have failed with chain too deep error", i)
+			}
+			if !errors.Is(err, ErrBackingChainTooDeep) {
+				t.Errorf("CreateOverlay %d error = %v, want ErrBackingChainTooDeep", i, err)
+			}
+			return // Test passed
+		}
+	}
+
+	t.Error("Expected backing chain depth limit to be enforced")
 }

@@ -37,9 +37,12 @@ type Image struct {
 	// Compressed cluster cache - keeps decompressed clusters
 	compressedCache *compressedClusterCache
 
-	// Refcount table offset cache
+	// Refcount table (level 1) - loaded entirely into memory
 	refcountTable     []byte
 	refcountTableLock sync.RWMutex
+
+	// Refcount block cache (level 2) - LRU cache of refcount blocks
+	refcountBlockCache *l2Cache
 
 	// Write tracking
 	readOnly bool
@@ -54,11 +57,37 @@ type Image struct {
 	// Backing file for COW chains
 	backing BackingStore
 
+	// Chain depth - how deep this image is in the backing chain (0 = top level)
+	chainDepth int
+
 	// Header extensions
 	extensions *HeaderExtensions
 
 	// Write ordering barrier mode
 	barrierMode WriteBarrierMode
+
+	// Buffer pool for cluster-sized allocations
+	clusterPool sync.Pool
+}
+
+// getClusterBuffer retrieves a cluster-sized buffer from the pool.
+// The buffer contents are undefined; caller must initialize if needed.
+func (img *Image) getClusterBuffer() []byte {
+	return img.clusterPool.Get().([]byte)
+}
+
+// putClusterBuffer returns a cluster-sized buffer to the pool.
+func (img *Image) putClusterBuffer(buf []byte) {
+	img.clusterPool.Put(buf)
+}
+
+// getZeroedClusterBuffer retrieves a zeroed cluster-sized buffer from the pool.
+func (img *Image) getZeroedClusterBuffer() []byte {
+	buf := img.getClusterBuffer()
+	for i := range buf {
+		buf[i] = 0
+	}
+	return buf
 }
 
 // metadataBarrier issues a sync if barrier mode requires it for metadata updates.
@@ -95,12 +124,21 @@ func Open(path string) (*Image, error) {
 
 // OpenFile opens a QCOW2 image with specific flags.
 func OpenFile(path string, flag int, perm os.FileMode) (*Image, error) {
+	return openFileWithDepth(path, flag, perm, 0)
+}
+
+// openFileWithDepth opens a QCOW2 image tracking backing chain depth.
+func openFileWithDepth(path string, flag int, perm os.FileMode, depth int) (*Image, error) {
+	if depth > MaxBackingChainDepth {
+		return nil, ErrBackingChainTooDeep
+	}
+
 	f, err := os.OpenFile(path, flag, perm)
 	if err != nil {
 		return nil, fmt.Errorf("qcow2: failed to open file: %w", err)
 	}
 
-	img, err := newImage(f, flag&os.O_RDWR == 0 || flag == os.O_RDONLY)
+	img, err := newImage(f, flag&os.O_RDWR == 0 || flag == os.O_RDONLY, depth)
 	if err != nil {
 		f.Close()
 		return nil, err
@@ -110,7 +148,7 @@ func OpenFile(path string, flag int, perm os.FileMode) (*Image, error) {
 }
 
 // newImage creates an Image from an already-open file.
-func newImage(f *os.File, readOnly bool) (*Image, error) {
+func newImage(f *os.File, readOnly bool, chainDepth int) (*Image, error) {
 	// Read header
 	headerBuf := make([]byte, HeaderSizeV3)
 	n, err := f.ReadAt(headerBuf, 0)
@@ -139,6 +177,7 @@ func newImage(f *os.File, readOnly bool) (*Image, error) {
 		offsetMask:    header.ClusterSize() - 1,
 		readOnly:      readOnly,
 		lazyRefcounts: header.HasLazyRefcounts(),
+		chainDepth:    chainDepth,
 		barrierMode:   BarrierMetadata, // Default: sync after metadata updates
 	}
 
@@ -155,6 +194,17 @@ func newImage(f *os.File, readOnly bool) (*Image, error) {
 
 	// Initialize compressed cluster cache (default 16 entries)
 	img.compressedCache = newCompressedClusterCache(16, int(img.clusterSize))
+
+	// Initialize refcount block cache (default 16 entries)
+	img.refcountBlockCache = newL2Cache(16, int(img.clusterSize))
+
+	// Initialize cluster buffer pool
+	clusterSize := img.clusterSize
+	img.clusterPool = sync.Pool{
+		New: func() interface{} {
+			return make([]byte, clusterSize)
+		},
+	}
 
 	// If lazy refcounts enabled and image is dirty, rebuild refcounts
 	if !readOnly && header.HasLazyRefcounts() && header.IsDirty() {
@@ -473,6 +523,62 @@ func (img *Image) getL2Table(offset uint64) ([]byte, error) {
 	return table, nil
 }
 
+// getOrAllocateL2Table returns the offset of the L2 table for the given L1 index,
+// allocating a new L2 table if necessary.
+func (img *Image) getOrAllocateL2Table(l1Index uint64) (uint64, error) {
+	// Ensure L1 table is large enough
+	if l1Index >= uint64(img.header.L1Size) {
+		return 0, fmt.Errorf("qcow2: write beyond L1 table bounds")
+	}
+
+	img.l1Mu.Lock()
+	defer img.l1Mu.Unlock()
+
+	l1Entry := binary.BigEndian.Uint64(img.l1Table[l1Index*8:])
+	l2TableOff := l1Entry & L1EntryOffsetMask
+
+	if l2TableOff != 0 {
+		return l2TableOff, nil
+	}
+
+	// Need to allocate L2 table
+	var err error
+	l2TableOff, err = img.allocateCluster()
+	if err != nil {
+		return 0, err
+	}
+
+	// Zero the new L2 table using pooled buffer
+	zeros := img.getZeroedClusterBuffer()
+	_, writeErr := img.file.WriteAt(zeros, int64(l2TableOff))
+	img.putClusterBuffer(zeros)
+	if writeErr != nil {
+		return 0, writeErr
+	}
+
+	// Barrier: ensure L2 table is on disk before L1 points to it
+	if err := img.metadataBarrier(); err != nil {
+		return 0, fmt.Errorf("qcow2: L2 table barrier failed: %w", err)
+	}
+
+	// Update L1 entry with COPIED flag set
+	newL1Entry := l2TableOff | L1EntryCopied
+	binary.BigEndian.PutUint64(img.l1Table[l1Index*8:], newL1Entry)
+
+	// Write L1 entry to disk
+	if _, err := img.file.WriteAt(img.l1Table[l1Index*8:l1Index*8+8],
+		int64(img.header.L1TableOffset+l1Index*8)); err != nil {
+		return 0, err
+	}
+
+	// Barrier: ensure L1 update is on disk
+	if err := img.metadataBarrier(); err != nil {
+		return 0, fmt.Errorf("qcow2: L1 update barrier failed: %w", err)
+	}
+
+	return l2TableOff, nil
+}
+
 // getClusterForWrite returns the physical offset for writing.
 // Allocates a new cluster if needed.
 func (img *Image) getClusterForWrite(virtOff uint64) (uint64, error) {
@@ -480,56 +586,11 @@ func (img *Image) getClusterForWrite(virtOff uint64) (uint64, error) {
 	l2Index := (virtOff >> img.clusterBits) & (img.l2Entries - 1)
 	l1Index := virtOff >> (img.clusterBits + img.l2Bits)
 
-	// Ensure L1 table is large enough
-	if l1Index >= uint64(img.header.L1Size) {
-		return 0, fmt.Errorf("qcow2: write beyond L1 table bounds")
-	}
-
 	// Get or allocate L2 table
-	img.l1Mu.Lock()
-	l1Entry := binary.BigEndian.Uint64(img.l1Table[l1Index*8:])
-	l2TableOff := l1Entry & L1EntryOffsetMask
-
-	if l2TableOff == 0 {
-		// Need to allocate L2 table
-		var err error
-		l2TableOff, err = img.allocateCluster()
-		if err != nil {
-			img.l1Mu.Unlock()
-			return 0, err
-		}
-
-		// Zero the new L2 table
-		zeros := make([]byte, img.clusterSize)
-		if _, err := img.file.WriteAt(zeros, int64(l2TableOff)); err != nil {
-			img.l1Mu.Unlock()
-			return 0, err
-		}
-
-		// Barrier: ensure L2 table is on disk before L1 points to it
-		if err := img.metadataBarrier(); err != nil {
-			img.l1Mu.Unlock()
-			return 0, fmt.Errorf("qcow2: L2 table barrier failed: %w", err)
-		}
-
-		// Update L1 entry with COPIED flag set
-		newL1Entry := l2TableOff | L1EntryCopied
-		binary.BigEndian.PutUint64(img.l1Table[l1Index*8:], newL1Entry)
-
-		// Write L1 entry to disk
-		if _, err := img.file.WriteAt(img.l1Table[l1Index*8:l1Index*8+8],
-			int64(img.header.L1TableOffset+l1Index*8)); err != nil {
-			img.l1Mu.Unlock()
-			return 0, err
-		}
-
-		// Barrier: ensure L1 update is on disk
-		if err := img.metadataBarrier(); err != nil {
-			img.l1Mu.Unlock()
-			return 0, fmt.Errorf("qcow2: L1 update barrier failed: %w", err)
-		}
+	l2TableOff, err := img.getOrAllocateL2Table(l1Index)
+	if err != nil {
+		return 0, err
 	}
-	img.l1Mu.Unlock()
 
 	// Get L2 table
 	l2Table, err := img.getL2Table(l2TableOff)
@@ -976,56 +1037,11 @@ func (img *Image) setZeroCluster(virtOff uint64) error {
 	l2Index := (virtOff >> img.clusterBits) & (img.l2Entries - 1)
 	l1Index := virtOff >> (img.clusterBits + img.l2Bits)
 
-	// Ensure L1 table is large enough
-	if l1Index >= uint64(img.header.L1Size) {
-		return fmt.Errorf("qcow2: write beyond L1 table bounds")
-	}
-
 	// Get or allocate L2 table
-	img.l1Mu.Lock()
-	l1Entry := binary.BigEndian.Uint64(img.l1Table[l1Index*8:])
-	l2TableOff := l1Entry & L1EntryOffsetMask
-
-	if l2TableOff == 0 {
-		// Need to allocate L2 table
-		var err error
-		l2TableOff, err = img.allocateCluster()
-		if err != nil {
-			img.l1Mu.Unlock()
-			return err
-		}
-
-		// Zero the new L2 table
-		zeros := make([]byte, img.clusterSize)
-		if _, err := img.file.WriteAt(zeros, int64(l2TableOff)); err != nil {
-			img.l1Mu.Unlock()
-			return err
-		}
-
-		// Barrier: ensure L2 table is on disk before L1 points to it
-		if err := img.metadataBarrier(); err != nil {
-			img.l1Mu.Unlock()
-			return fmt.Errorf("qcow2: L2 table barrier failed: %w", err)
-		}
-
-		// Update L1 entry with COPIED flag set
-		newL1Entry := l2TableOff | L1EntryCopied
-		binary.BigEndian.PutUint64(img.l1Table[l1Index*8:], newL1Entry)
-
-		// Write L1 entry to disk
-		if _, err := img.file.WriteAt(img.l1Table[l1Index*8:l1Index*8+8],
-			int64(img.header.L1TableOffset+l1Index*8)); err != nil {
-			img.l1Mu.Unlock()
-			return err
-		}
-
-		// Barrier: ensure L1 update is on disk
-		if err := img.metadataBarrier(); err != nil {
-			img.l1Mu.Unlock()
-			return fmt.Errorf("qcow2: L1 update barrier failed: %w", err)
-		}
+	l2TableOff, err := img.getOrAllocateL2Table(l1Index)
+	if err != nil {
+		return err
 	}
-	img.l1Mu.Unlock()
 
 	// Get L2 table
 	l2Table, err := img.getL2Table(l2TableOff)

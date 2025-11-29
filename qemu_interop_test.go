@@ -14,6 +14,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 
 	"github.com/ehrlich-b/go-qcow2/testutil"
@@ -149,9 +150,9 @@ func TestQemuInterop_WriteWithUs_ReadWithQemu(t *testing.T) {
 		length  int
 	}{
 		{0xAA, 0, 4096},
-		{0xBB, 65536, 4096},        // Second cluster
-		{0xCC, 131072 - 100, 200},  // Cross cluster boundary (clusters 2-3)
-		{0xDD, 1024 * 1024, 8192},  // 1MB offset
+		{0xBB, 65536, 4096},       // Second cluster
+		{0xCC, 131072 - 100, 200}, // Cross cluster boundary (clusters 2-3)
+		{0xDD, 1024 * 1024, 8192}, // 1MB offset
 	}
 
 	for _, p := range patterns {
@@ -576,7 +577,7 @@ func byteSizeStr(size int64) string {
 }
 
 func itoa(n int64) string {
-	return string([]byte{byte('0' + n%10)})
+	return strconv.FormatInt(n, 10)
 }
 
 // TestQemuInterop_Version tests against different QEMU output formats.

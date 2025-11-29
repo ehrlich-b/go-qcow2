@@ -8,15 +8,32 @@ import (
 )
 
 // parseCompressedL2Entry extracts offset and size from a compressed L2 entry.
-// For compressed clusters, the L2 entry format is:
-//   - Bit 62: Compression flag (always set)
-//   - Bits 0 to x-1: Host cluster offset
-//   - Bits x to 61: Compressed size - 1 (in 512-byte sectors)
 //
-// Where x = 62 - (cluster_bits - 8)
+// Compressed L2 entry format (from QCOW2 spec):
+//
+//	Bit  62:     Always 1 (compression flag)
+//	Bits 0..x-1: Host cluster offset (byte-aligned, not 512-byte aligned like normal entries)
+//	Bits x..61:  Compressed size minus one, in 512-byte sectors
+//
+// The value of x depends on cluster size:
+//
+//	x = 62 - (cluster_bits - 8)
+//	  = 62 - cluster_bits + 8
+//	  = 70 - cluster_bits
+//
+// For default 64KB clusters (cluster_bits=16):
+//
+//	x = 70 - 16 = 54
+//	Offset uses bits 0-53 (54 bits = max 16 PB addressable)
+//	Size uses bits 54-61 (8 bits = max 256 sectors = 128KB compressed)
+//
+// For 4KB clusters (cluster_bits=12):
+//
+//	x = 70 - 12 = 58
+//	Offset uses bits 0-57 (58 bits)
+//	Size uses bits 58-61 (4 bits = max 16 sectors = 8KB compressed)
 func (img *Image) parseCompressedL2Entry(l2Entry uint64) (offset uint64, compressedSize uint64) {
-	// Calculate the number of bits for the offset
-	// x = 62 - (cluster_bits - 8) = 70 - cluster_bits
+	// x = 70 - cluster_bits (see formula derivation above)
 	x := 70 - img.clusterBits
 
 	// Extract offset (bits 0 to x-1)
@@ -33,6 +50,11 @@ func (img *Image) parseCompressedL2Entry(l2Entry uint64) (offset uint64, compres
 
 // decompressCluster reads and decompresses a compressed cluster.
 func (img *Image) decompressCluster(l2Entry uint64) ([]byte, error) {
+	// Check for zstd compression (not supported - requires external library)
+	if img.header.CompressionType == CompressionZstd {
+		return nil, ErrUnsupportedCompression
+	}
+
 	offset, compressedSize := img.parseCompressedL2Entry(l2Entry)
 
 	// Read compressed data
@@ -43,8 +65,8 @@ func (img *Image) decompressCluster(l2Entry uint64) ([]byte, error) {
 	}
 	compressed = compressed[:n]
 
-	// Decompress using zlib/deflate
-	// QCOW2 uses raw deflate (no zlib header)
+	// Decompress using deflate (zlib without header)
+	// This is the default compression for QCOW2 (CompressionZlib)
 	reader := flate.NewReader(bytes.NewReader(compressed))
 	defer reader.Close()
 

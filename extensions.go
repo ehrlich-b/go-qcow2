@@ -31,17 +31,20 @@ type HeaderExtensions struct {
 }
 
 // parseHeaderExtensions reads all header extensions from the image file.
-// Extensions start at header.HeaderLength and end at either:
+// Extensions start at:
+// - V2: Byte 72 (after the fixed header)
+// - V3: header.HeaderLength
+// And end at either:
 // - The backing file offset (if present)
 // - The end of cluster 0
 func (img *Image) parseHeaderExtensions() (*HeaderExtensions, error) {
-	if img.header.Version < Version3 {
-		// V2 doesn't have header extensions at the same location
-		// (they would be after the 72-byte header)
-		return &HeaderExtensions{}, nil
+	var startOffset uint64
+	if img.header.Version >= Version3 {
+		startOffset = uint64(img.header.HeaderLength)
+	} else {
+		// V2 extensions start right after the 72-byte header
+		startOffset = HeaderSizeV2
 	}
-
-	startOffset := uint64(img.header.HeaderLength)
 	endOffset := img.clusterSize // End of header cluster
 
 	// If backing file is in cluster 0, stop there

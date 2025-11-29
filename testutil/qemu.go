@@ -28,24 +28,24 @@ func (r QemuResult) IsSuccess() bool {
 // QemuCheckResult holds parsed output from qemu-img check.
 type QemuCheckResult struct {
 	QemuResult
-	ImageEndOffset    int64 `json:"image-end-offset"`
-	TotalClusters     int64 `json:"total-clusters"`
-	AllocatedClusters int64 `json:"allocated-clusters"`
+	ImageEndOffset     int64 `json:"image-end-offset"`
+	TotalClusters      int64 `json:"total-clusters"`
+	AllocatedClusters  int64 `json:"allocated-clusters"`
 	FragmentedClusters int64 `json:"fragmented-clusters"`
 	CompressedClusters int64 `json:"compressed-clusters"`
-	Corruptions       int   `json:"corruptions"`
-	Leaks             int   `json:"leaks"`
-	LeaksClusters     int64 `json:"leaks-fixed"`
-	IsClean           bool
+	Corruptions        int   `json:"corruptions"`
+	Leaks              int   `json:"leaks"`
+	LeaksClusters      int64 `json:"leaks-fixed"`
+	IsClean            bool
 }
 
 // QemuInfoResult holds parsed output from qemu-img info.
 type QemuInfoResult struct {
 	QemuResult
-	VirtualSize   int64  `json:"virtual-size"`
-	Filename      string `json:"filename"`
-	ClusterSize   int    `json:"cluster-size"`
-	Format        string `json:"format"`
+	VirtualSize    int64  `json:"virtual-size"`
+	Filename       string `json:"filename"`
+	ClusterSize    int    `json:"cluster-size"`
+	Format         string `json:"format"`
 	FormatSpecific struct {
 		Type string `json:"type"`
 		Data struct {

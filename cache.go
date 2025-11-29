@@ -7,12 +7,11 @@ import (
 // l2Cache is a simple LRU cache for L2 tables.
 // Uses []byte slices directly to avoid struct allocation overhead.
 type l2Cache struct {
-	mu       sync.RWMutex
-	entries  map[uint64]*cacheEntry
-	head     *cacheEntry // Most recently used
-	tail     *cacheEntry // Least recently used
-	maxSize  int
-	tableLen int
+	mu      sync.RWMutex
+	entries map[uint64]*cacheEntry
+	head    *cacheEntry // Most recently used
+	tail    *cacheEntry // Least recently used
+	maxSize int
 }
 
 type cacheEntry struct {
@@ -23,13 +22,11 @@ type cacheEntry struct {
 }
 
 // newL2Cache creates a new L2 table cache.
-// maxSize is the maximum number of L2 tables to cache.
-// tableLen is the size of each L2 table in bytes.
-func newL2Cache(maxSize, tableLen int) *l2Cache {
+// maxSize is the maximum number of entries to cache.
+func newL2Cache(maxSize, _ int) *l2Cache {
 	return &l2Cache{
-		entries:  make(map[uint64]*cacheEntry),
-		maxSize:  maxSize,
-		tableLen: tableLen,
+		entries: make(map[uint64]*cacheEntry),
+		maxSize: maxSize,
 	}
 }
 

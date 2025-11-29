@@ -37,6 +37,12 @@ const (
 	EncryptionLUKS = 2
 )
 
+// Compression types (when IncompatCompression feature is set)
+const (
+	CompressionZlib = 0 // Deflate (default)
+	CompressionZstd = 1 // Zstandard
+)
+
 // Incompatible feature bits (must understand to open)
 const (
 	IncompatDirtyBit     = 1 << 0 // Image needs repair
@@ -124,18 +130,27 @@ type Header struct {
 	AutoclearFeatures    uint64
 	RefcountOrder        uint32 // Refcount bits = 1 << refcount_order
 	HeaderLength         uint32
+
+	// Compression type (when IncompatCompression feature is set)
+	CompressionType uint8
 }
+
+// MaxBackingChainDepth is the maximum depth of the backing file chain.
+// This matches QEMU's limit and prevents resource exhaustion from malicious images.
+const MaxBackingChainDepth = 64
 
 // Errors
 var (
-	ErrInvalidMagic       = errors.New("qcow2: invalid magic number")
-	ErrUnsupportedVersion = errors.New("qcow2: unsupported version")
-	ErrInvalidClusterBits = errors.New("qcow2: invalid cluster bits")
-	ErrIncompatFeatures   = errors.New("qcow2: unsupported incompatible features")
-	ErrCorruptImage       = errors.New("qcow2: image is marked corrupt")
-	ErrImageDirty         = errors.New("qcow2: image is marked dirty, needs repair")
-	ErrOffsetOutOfRange   = errors.New("qcow2: offset out of range")
-	ErrReadOnly           = errors.New("qcow2: image is read-only")
+	ErrInvalidMagic           = errors.New("qcow2: invalid magic number")
+	ErrUnsupportedVersion     = errors.New("qcow2: unsupported version")
+	ErrInvalidClusterBits     = errors.New("qcow2: invalid cluster bits")
+	ErrIncompatFeatures       = errors.New("qcow2: unsupported incompatible features")
+	ErrCorruptImage           = errors.New("qcow2: image is marked corrupt")
+	ErrImageDirty             = errors.New("qcow2: image is marked dirty, needs repair")
+	ErrOffsetOutOfRange       = errors.New("qcow2: offset out of range")
+	ErrReadOnly               = errors.New("qcow2: image is read-only")
+	ErrBackingChainTooDeep    = errors.New("qcow2: backing file chain exceeds maximum depth")
+	ErrUnsupportedCompression = errors.New("qcow2: unsupported compression type (zstd requires external library)")
 )
 
 // ParseHeader reads and validates a QCOW2 header from raw bytes.
@@ -183,6 +198,11 @@ func ParseHeader(data []byte) (*Header, error) {
 		h.AutoclearFeatures = binary.BigEndian.Uint64(data[88:96])
 		h.RefcountOrder = binary.BigEndian.Uint32(data[96:100])
 		h.HeaderLength = binary.BigEndian.Uint32(data[100:104])
+
+		// Parse compression type if the feature bit is set
+		if h.IncompatibleFeatures&IncompatCompression != 0 && len(data) > 104 {
+			h.CompressionType = data[104]
+		}
 	} else {
 		// Version 2 defaults
 		h.RefcountOrder = 4 // 16-bit refcounts

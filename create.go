@@ -243,8 +243,8 @@ func Create(path string, opts CreateOptions) (*Image, error) {
 		return nil, fmt.Errorf("qcow2: failed to sync: %w", err)
 	}
 
-	// Now open as normal image
-	img, err := newImage(f, false)
+	// Now open as normal image (depth=0 for newly created image)
+	img, err := newImage(f, false, 0)
 	if err != nil {
 		f.Close()
 		os.Remove(path)

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // RawImage wraps an *os.File to implement BackingStore for raw backing files.
@@ -36,6 +37,15 @@ func (img *Image) openBackingFile() error {
 
 	backingPath := string(pathBuf)
 
+	// Validate backing file path
+	if strings.ContainsRune(backingPath, 0) {
+		return fmt.Errorf("qcow2: backing file path contains null byte")
+	}
+	backingPath = strings.TrimSpace(backingPath)
+	if backingPath == "" {
+		return fmt.Errorf("qcow2: backing file path is empty")
+	}
+
 	// Resolve relative paths relative to the image file
 	if !filepath.IsAbs(backingPath) {
 		imgPath := img.file.Name()
@@ -61,7 +71,8 @@ func (img *Image) openBackingFile() error {
 
 	case "qcow2", "":
 		// Open as qcow2 (default if format not specified)
-		backing, err := OpenFile(backingPath, os.O_RDONLY, 0)
+		// Pass depth+1 to track backing chain depth
+		backing, err := openFileWithDepth(backingPath, os.O_RDONLY, 0, img.chainDepth+1)
 		if err != nil {
 			return fmt.Errorf("qcow2: failed to open backing file %q: %w", backingPath, err)
 		}

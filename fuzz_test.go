@@ -63,7 +63,7 @@ func FuzzParseHeader(f *testing.F) {
 	f.Add(validV3Header())
 
 	// Seed with edge cases
-	f.Add([]byte{}) // Empty
+	f.Add([]byte{})                        // Empty
 	f.Add([]byte{0x51, 0x46, 0x49, 0xfb})  // Just magic
 	f.Add(make([]byte, HeaderSizeV2-1))    // One byte short
 	f.Add(make([]byte, HeaderSizeV3))      // All zeros
@@ -111,12 +111,12 @@ func FuzzParseHeader(f *testing.F) {
 // FuzzL2Entry fuzzes L2 entry interpretation.
 func FuzzL2Entry(f *testing.F) {
 	// Seed with known L2 entry patterns
-	f.Add(uint64(0))                             // Unallocated
-	f.Add(uint64(L2EntryZeroFlag))               // Zero cluster
-	f.Add(uint64(0x50000 | L2EntryCopied))       // Normal allocated
-	f.Add(uint64(L2EntryCompressed | 0x1000))    // Compressed
-	f.Add(uint64(0xFFFFFFFFFFFFFFFF))            // All bits set
-	f.Add(uint64(L2EntryOffsetMask))             // Max offset
+	f.Add(uint64(0))                               // Unallocated
+	f.Add(uint64(L2EntryZeroFlag))                 // Zero cluster
+	f.Add(uint64(0x50000 | L2EntryCopied))         // Normal allocated
+	f.Add(uint64(L2EntryCompressed | 0x1000))      // Compressed
+	f.Add(uint64(0xFFFFFFFFFFFFFFFF))              // All bits set
+	f.Add(uint64(L2EntryOffsetMask))               // Max offset
 	f.Add(uint64(L2EntryCopied | L2EntryZeroFlag)) // Copied + zero
 
 	f.Fuzz(func(t *testing.T, entry uint64) {
@@ -146,7 +146,7 @@ func FuzzReadWrite(f *testing.F) {
 	f.Add(int64(0), []byte("test"))
 	f.Add(int64(65535), []byte("boundary"))
 	f.Add(int64(65536), []byte("cluster start"))
-	f.Add(int64(0), []byte{})                       // Empty write
+	f.Add(int64(0), []byte{})                        // Empty write
 	f.Add(int64(0), bytes.Repeat([]byte{0xAA}, 100)) // Pattern
 	f.Add(int64(1000000), []byte("far offset"))
 
