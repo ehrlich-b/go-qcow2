@@ -61,7 +61,7 @@
 
 ---
 
-## Phase 3: Common Features ⚠️ IN PROGRESS
+## Phase 3: Common Features ✅ COMPLETE
 
 ### Zero Clusters ✅
 - [x] Detect zero flag in L2 entry (bit 0)
@@ -83,13 +83,13 @@
 - [x] Fail on unknown incompatible features (in Validate())
 - [x] V2 extension parsing
 
-### Snapshots - Internal ⚠️ Partial
+### Snapshots - Internal ✅
 - [x] Parse snapshot table structure
 - [x] Snapshot directory entries (FindSnapshot, Snapshots)
 - [x] Read from specific snapshot (ReadAtSnapshot)
 - [x] Create snapshot (copy L1 table, update refcounts, COW support)
-- [ ] Delete snapshot
-- [ ] Revert to snapshot
+- [x] Delete snapshot
+- [x] Revert to snapshot
 
 ---
 

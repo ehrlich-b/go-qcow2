@@ -975,3 +975,414 @@ func TestQemuInterop_CreateSnapshot(t *testing.T) {
 		}
 	}
 }
+
+// TestQemuInterop_DeleteSnapshot tests that deleting snapshots with go-qcow2 produces valid images.
+func TestQemuInterop_DeleteSnapshot(t *testing.T) {
+	t.Parallel()
+	testutil.RequireQemu(t)
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.qcow2")
+
+	// Create image with go-qcow2
+	img, err := CreateSimple(path, 64*1024*1024) // 64MB
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+
+	// Write pattern 0xAA to first cluster
+	pattern1 := bytes.Repeat([]byte{0xAA}, 4096)
+	if _, err := img.WriteAt(pattern1, 0); err != nil {
+		img.Close()
+		t.Fatalf("WriteAt failed: %v", err)
+	}
+
+	// Create first snapshot
+	_, err = img.CreateSnapshot("snap1")
+	if err != nil {
+		img.Close()
+		t.Fatalf("CreateSnapshot(snap1) failed: %v", err)
+	}
+
+	// Write pattern 0xBB
+	pattern2 := bytes.Repeat([]byte{0xBB}, 4096)
+	if _, err := img.WriteAt(pattern2, 0); err != nil {
+		img.Close()
+		t.Fatalf("WriteAt failed: %v", err)
+	}
+
+	// Create second snapshot
+	_, err = img.CreateSnapshot("snap2")
+	if err != nil {
+		img.Close()
+		t.Fatalf("CreateSnapshot(snap2) failed: %v", err)
+	}
+
+	// Write pattern 0xCC
+	pattern3 := bytes.Repeat([]byte{0xCC}, 4096)
+	if _, err := img.WriteAt(pattern3, 0); err != nil {
+		img.Close()
+		t.Fatalf("WriteAt failed: %v", err)
+	}
+
+	// Create third snapshot
+	_, err = img.CreateSnapshot("snap3")
+	if err != nil {
+		img.Close()
+		t.Fatalf("CreateSnapshot(snap3) failed: %v", err)
+	}
+
+	// Verify we have 3 snapshots
+	if len(img.Snapshots()) != 3 {
+		img.Close()
+		t.Fatalf("Expected 3 snapshots, got %d", len(img.Snapshots()))
+	}
+
+	// Delete middle snapshot (snap2)
+	if err := img.DeleteSnapshot("snap2"); err != nil {
+		img.Close()
+		t.Fatalf("DeleteSnapshot(snap2) failed: %v", err)
+	}
+
+	// Verify we have 2 snapshots
+	if len(img.Snapshots()) != 2 {
+		img.Close()
+		t.Fatalf("After delete: expected 2 snapshots, got %d", len(img.Snapshots()))
+	}
+
+	// Verify snap2 is gone
+	if img.FindSnapshot("snap2") != nil {
+		img.Close()
+		t.Fatal("snap2 should be deleted but still found")
+	}
+
+	// Verify snap1 and snap3 still exist
+	if img.FindSnapshot("snap1") == nil {
+		img.Close()
+		t.Fatal("snap1 should still exist")
+	}
+	if img.FindSnapshot("snap3") == nil {
+		img.Close()
+		t.Fatal("snap3 should still exist")
+	}
+
+	// Close and verify with qemu-img check
+	img.Flush()
+	img.Close()
+
+	checkResult := testutil.RunQemuImg(t, "check", path)
+	if !checkResult.IsSuccess() {
+		t.Errorf("qemu-img check failed after delete: %s", checkResult.Stderr)
+	}
+
+	// Verify QEMU sees only 2 snapshots
+	qemuSnaps := testutil.QemuListSnapshots(t, path)
+	if len(qemuSnaps) != 2 {
+		t.Fatalf("QEMU reports %d snapshots, want 2", len(qemuSnaps))
+	}
+
+	// Re-open and verify we can still read from remaining snapshots
+	img2, err := Open(path)
+	if err != nil {
+		t.Fatalf("Re-open failed: %v", err)
+	}
+	defer img2.Close()
+
+	// Read from snap1 - should be 0xAA
+	snap1 := img2.FindSnapshot("snap1")
+	if snap1 == nil {
+		t.Fatal("FindSnapshot(snap1) returned nil after re-open")
+	}
+	buf := make([]byte, 4096)
+	if _, err := img2.ReadAtSnapshot(buf, 0, snap1); err != nil {
+		t.Fatalf("ReadAtSnapshot(snap1) failed: %v", err)
+	}
+	for i, b := range buf {
+		if b != 0xAA {
+			t.Errorf("Snapshot snap1: byte %d = 0x%02X, want 0xAA", i, b)
+			break
+		}
+	}
+
+	// Read from snap3 - should be 0xCC
+	snap3 := img2.FindSnapshot("snap3")
+	if snap3 == nil {
+		t.Fatal("FindSnapshot(snap3) returned nil after re-open")
+	}
+	if _, err := img2.ReadAtSnapshot(buf, 0, snap3); err != nil {
+		t.Fatalf("ReadAtSnapshot(snap3) failed: %v", err)
+	}
+	for i, b := range buf {
+		if b != 0xCC {
+			t.Errorf("Snapshot snap3: byte %d = 0x%02X, want 0xCC", i, b)
+			break
+		}
+	}
+}
+
+// TestQemuInterop_DeleteAllSnapshots tests deleting all snapshots.
+func TestQemuInterop_DeleteAllSnapshots(t *testing.T) {
+	t.Parallel()
+	testutil.RequireQemu(t)
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.qcow2")
+
+	// Create image with go-qcow2
+	img, err := CreateSimple(path, 64*1024*1024) // 64MB
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+
+	// Write some data
+	pattern := bytes.Repeat([]byte{0xAA}, 4096)
+	if _, err := img.WriteAt(pattern, 0); err != nil {
+		img.Close()
+		t.Fatalf("WriteAt failed: %v", err)
+	}
+
+	// Create snapshot
+	_, err = img.CreateSnapshot("snap1")
+	if err != nil {
+		img.Close()
+		t.Fatalf("CreateSnapshot failed: %v", err)
+	}
+
+	// Delete the snapshot
+	if err := img.DeleteSnapshot("snap1"); err != nil {
+		img.Close()
+		t.Fatalf("DeleteSnapshot failed: %v", err)
+	}
+
+	// Verify no snapshots
+	if len(img.Snapshots()) != 0 {
+		img.Close()
+		t.Fatalf("Expected 0 snapshots, got %d", len(img.Snapshots()))
+	}
+
+	img.Flush()
+	img.Close()
+
+	// Verify with qemu-img check
+	checkResult := testutil.RunQemuImg(t, "check", path)
+	if !checkResult.IsSuccess() {
+		t.Errorf("qemu-img check failed: %s", checkResult.Stderr)
+	}
+
+	// Verify QEMU sees 0 snapshots
+	qemuSnaps := testutil.QemuListSnapshots(t, path)
+	if len(qemuSnaps) != 0 {
+		t.Fatalf("QEMU reports %d snapshots, want 0", len(qemuSnaps))
+	}
+
+	// Re-open and verify data is intact
+	img2, err := Open(path)
+	if err != nil {
+		t.Fatalf("Re-open failed: %v", err)
+	}
+	defer img2.Close()
+
+	buf := make([]byte, 4096)
+	if _, err := img2.ReadAt(buf, 0); err != nil {
+		t.Fatalf("ReadAt failed: %v", err)
+	}
+	for i, b := range buf {
+		if b != 0xAA {
+			t.Errorf("Data: byte %d = 0x%02X, want 0xAA", i, b)
+			break
+		}
+	}
+}
+
+// TestQemuInterop_RevertToSnapshot tests reverting to a snapshot.
+func TestQemuInterop_RevertToSnapshot(t *testing.T) {
+	t.Parallel()
+	testutil.RequireQemu(t)
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.qcow2")
+
+	// Create image with go-qcow2
+	img, err := CreateSimple(path, 64*1024*1024) // 64MB
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+
+	// Write pattern 0xAA to first cluster
+	pattern1 := bytes.Repeat([]byte{0xAA}, 4096)
+	if _, err := img.WriteAt(pattern1, 0); err != nil {
+		img.Close()
+		t.Fatalf("WriteAt failed: %v", err)
+	}
+
+	// Create snapshot
+	_, err = img.CreateSnapshot("snap1")
+	if err != nil {
+		img.Close()
+		t.Fatalf("CreateSnapshot failed: %v", err)
+	}
+
+	// Write different pattern 0xBB to first cluster
+	pattern2 := bytes.Repeat([]byte{0xBB}, 4096)
+	if _, err := img.WriteAt(pattern2, 0); err != nil {
+		img.Close()
+		t.Fatalf("WriteAt failed: %v", err)
+	}
+
+	// Verify current state is 0xBB
+	buf := make([]byte, 4096)
+	if _, err := img.ReadAt(buf, 0); err != nil {
+		img.Close()
+		t.Fatalf("ReadAt failed: %v", err)
+	}
+	if buf[0] != 0xBB {
+		img.Close()
+		t.Fatalf("Before revert: expected 0xBB, got 0x%02X", buf[0])
+	}
+
+	// Revert to snapshot
+	if err := img.RevertToSnapshot("snap1"); err != nil {
+		img.Close()
+		t.Fatalf("RevertToSnapshot failed: %v", err)
+	}
+
+	// Verify current state is now 0xAA (reverted)
+	if _, err := img.ReadAt(buf, 0); err != nil {
+		img.Close()
+		t.Fatalf("ReadAt after revert failed: %v", err)
+	}
+	for i, b := range buf {
+		if b != 0xAA {
+			img.Close()
+			t.Fatalf("After revert: byte %d = 0x%02X, want 0xAA", i, b)
+		}
+	}
+
+	img.Flush()
+	img.Close()
+
+	// Verify with qemu-img check
+	checkResult := testutil.RunQemuImg(t, "check", path)
+	if !checkResult.IsSuccess() {
+		t.Errorf("qemu-img check failed: %s", checkResult.Stderr)
+	}
+
+	// Re-open and verify state persists
+	img2, err := Open(path)
+	if err != nil {
+		t.Fatalf("Re-open failed: %v", err)
+	}
+	defer img2.Close()
+
+	if _, err := img2.ReadAt(buf, 0); err != nil {
+		t.Fatalf("ReadAt after re-open failed: %v", err)
+	}
+	for i, b := range buf {
+		if b != 0xAA {
+			t.Errorf("After re-open: byte %d = 0x%02X, want 0xAA", i, b)
+			break
+		}
+	}
+}
+
+// TestQemuInterop_RevertToSnapshotMultiple tests reverting with multiple snapshots.
+func TestQemuInterop_RevertToSnapshotMultiple(t *testing.T) {
+	t.Parallel()
+	testutil.RequireQemu(t)
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.qcow2")
+
+	// Create image with go-qcow2
+	img, err := CreateSimple(path, 64*1024*1024) // 64MB
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+
+	// Write pattern 0xAA
+	pattern1 := bytes.Repeat([]byte{0xAA}, 4096)
+	if _, err := img.WriteAt(pattern1, 0); err != nil {
+		img.Close()
+		t.Fatalf("WriteAt failed: %v", err)
+	}
+
+	// Create first snapshot
+	_, err = img.CreateSnapshot("snap1")
+	if err != nil {
+		img.Close()
+		t.Fatalf("CreateSnapshot(snap1) failed: %v", err)
+	}
+
+	// Write pattern 0xBB
+	pattern2 := bytes.Repeat([]byte{0xBB}, 4096)
+	if _, err := img.WriteAt(pattern2, 0); err != nil {
+		img.Close()
+		t.Fatalf("WriteAt failed: %v", err)
+	}
+
+	// Create second snapshot
+	_, err = img.CreateSnapshot("snap2")
+	if err != nil {
+		img.Close()
+		t.Fatalf("CreateSnapshot(snap2) failed: %v", err)
+	}
+
+	// Write pattern 0xCC
+	pattern3 := bytes.Repeat([]byte{0xCC}, 4096)
+	if _, err := img.WriteAt(pattern3, 0); err != nil {
+		img.Close()
+		t.Fatalf("WriteAt failed: %v", err)
+	}
+
+	// Revert to snap1 (skip snap2)
+	if err := img.RevertToSnapshot("snap1"); err != nil {
+		img.Close()
+		t.Fatalf("RevertToSnapshot(snap1) failed: %v", err)
+	}
+
+	// Verify current state is 0xAA
+	buf := make([]byte, 4096)
+	if _, err := img.ReadAt(buf, 0); err != nil {
+		img.Close()
+		t.Fatalf("ReadAt failed: %v", err)
+	}
+	for i, b := range buf {
+		if b != 0xAA {
+			img.Close()
+			t.Fatalf("After revert to snap1: byte %d = 0x%02X, want 0xAA", i, b)
+		}
+	}
+
+	// Verify snapshots still exist
+	if len(img.Snapshots()) != 2 {
+		img.Close()
+		t.Fatalf("Expected 2 snapshots, got %d", len(img.Snapshots()))
+	}
+
+	// Now revert to snap2
+	if err := img.RevertToSnapshot("snap2"); err != nil {
+		img.Close()
+		t.Fatalf("RevertToSnapshot(snap2) failed: %v", err)
+	}
+
+	// Verify current state is 0xBB
+	if _, err := img.ReadAt(buf, 0); err != nil {
+		img.Close()
+		t.Fatalf("ReadAt failed: %v", err)
+	}
+	for i, b := range buf {
+		if b != 0xBB {
+			img.Close()
+			t.Fatalf("After revert to snap2: byte %d = 0x%02X, want 0xBB", i, b)
+		}
+	}
+
+	img.Flush()
+	img.Close()
+
+	// Verify with qemu-img check
+	checkResult := testutil.RunQemuImg(t, "check", path)
+	if !checkResult.IsSuccess() {
+		t.Errorf("qemu-img check failed: %s", checkResult.Stderr)
+	}
+}
