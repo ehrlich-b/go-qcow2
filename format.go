@@ -57,6 +57,25 @@ const (
 	AutoclearRawExternal = 1 << 1
 )
 
+// WriteBarrierMode controls how write ordering barriers are applied.
+// Barriers ensure crash consistency by syncing data to disk before
+// updating metadata that references it.
+type WriteBarrierMode int
+
+const (
+	// BarrierNone disables write ordering barriers (fastest, least safe).
+	// Use only for testing or when the underlying storage provides barriers.
+	BarrierNone WriteBarrierMode = iota
+
+	// BarrierMetadata syncs after metadata updates (L1/L2 table changes).
+	// This ensures metadata is consistent on disk but data writes may be lost.
+	BarrierMetadata
+
+	// BarrierFull syncs after every write operation (slowest, safest).
+	// Guarantees data written before metadata updates are on disk.
+	BarrierFull
+)
+
 // L2 entry flags (in the high bits of the 64-bit entry)
 const (
 	L2EntryCompressed = uint64(1) << 62

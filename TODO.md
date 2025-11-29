@@ -1,6 +1,23 @@
 # TODO - go-qcow2 Roadmap
 
-## Phase 1: Core Functionality (Current)
+## Immediate Fixes (From Code Review)
+
+### Critical Bugs
+- [ ] Fix `itoa()` helper in qemu_interop_test.go (only returns single digit)
+- [ ] Add backing chain depth limit (prevent infinite recursion, QEMU uses 64)
+- [ ] Remove or use `refcountTable` struct (currently dead code in refcount.go)
+
+### High Priority Issues
+- [ ] Cache refcount blocks like L2 tables (currently reads from disk every time)
+- [ ] Refactor L2 table allocation logic (duplicated in getClusterForWrite and setZeroCluster)
+- [ ] Add zstd decompression support (deflate only currently)
+- [ ] Fix V2 header extension parsing (currently skips extensions for v2)
+- [ ] Validate backing file path (prevent null bytes, sanitize)
+- [ ] Add file size limits to prevent OOM on malicious headers
+
+---
+
+## Phase 1: Core Functionality ✅ COMPLETE
 
 ### Completed
 - [x] Project setup (go.mod, README, CLAUDE.md)
@@ -15,66 +32,69 @@
 - [x] Image creation (`Create()` function)
 - [x] Basic unit tests
 
-### In Progress
-- [ ] E2E test suite with QEMU interoperability
-
 ---
 
-## Phase 2: Production-Ready
+## Phase 2: Production-Ready ⚠️ MOSTLY COMPLETE
 
-### Refcount Management (Hard - Critical)
-- [ ] Two-level refcount structure (table -> blocks)
-- [ ] Variable refcount width (1, 2, 4, 8, 16, 32, 64 bits)
-- [ ] Read refcount for cluster
-- [ ] Update refcount on allocation
-- [ ] Update refcount on deallocation
-- [ ] Free-space tracking via refcounts
+> **Review Note**: Downgraded from "COMPLETE" - Several edge cases and issues identified.
 
-### Backing Files (Medium - Very Common)
+### Refcount Management ⚠️ (Works but needs improvement)
+- [x] Two-level refcount structure (table -> blocks)
+- [x] Variable refcount width (1, 2, 4, 8, 16, 32, 64 bits)
+- [x] Read refcount for cluster
+- [x] Update refcount on allocation
+- [x] Update refcount on deallocation (via WriteZeroAt)
+- [x] Free-space tracking via refcounts (findFreeCluster)
+- [ ] **FIX**: Cache refcount blocks (performance)
+- [ ] **FIX**: Resolve circular dependency in allocateRefcountBlock
+
+### Backing Files ✅ (Complete)
 - [x] Parse backing file path from header
-- [ ] Backing file format extension (0xe2792aca)
+- [x] Backing file format extension (0xe2792aca)
 - [x] Open backing file chain recursively
 - [x] Fall through to backing on unallocated read
 - [x] Copy-on-write: copy from backing on partial cluster write
 - [x] Path resolution relative to child image
 - [x] CreateOverlay helper function
+- [x] Raw backing file support
+- [ ] **FIX**: Add chain depth limit (security)
 
-### Lazy Refcounts (Hard - Common)
-- [ ] Detect `lazy_refcounts` compatible feature
-- [ ] Defer refcount updates during writes
-- [ ] Mark image dirty on write
-- [ ] Refcount rebuild on open if dirty
-- [ ] Scan L1/L2 tables to repair refcounts
+### Lazy Refcounts ✅ (Complete)
+- [x] Detect `lazy_refcounts` compatible feature
+- [x] Defer refcount updates during writes
+- [x] Mark image dirty on write
+- [x] Refcount rebuild on open if dirty
+- [x] Scan L1/L2 tables to repair refcounts
 
-### Safety Mechanisms (Medium - Essential)
-- [ ] Mark image dirty (incompatible bit 0) on RW open
-- [ ] Clear dirty bit on clean close
-- [ ] Detect corrupt bit (incompatible bit 1)
-- [ ] Refuse writes to corrupt images
-- [ ] Overlap checks (prevent metadata corruption)
-- [ ] Write ordering barriers
+### Safety Mechanisms ✅ (Complete)
+- [x] Mark image dirty (incompatible bit 0) on RW open
+- [x] Clear dirty bit on clean close
+- [x] Detect corrupt bit (incompatible bit 1)
+- [x] Refuse writes to corrupt images
+- [x] Overlap checks (prevent metadata corruption)
+- [x] Write ordering barriers (configurable via WriteBarrierMode)
 
-### Repair Capabilities (Hard - Important)
-- [ ] Scan L1/L2 tables for consistency
-- [ ] Rebuild refcounts from L1/L2
-- [ ] Check command equivalent
-- [ ] Detect and report inconsistencies
+### Repair Capabilities ✅ (Complete)
+- [x] Scan L1/L2 tables for consistency
+- [x] Rebuild refcounts from L1/L2
+- [x] Check command equivalent
+- [x] Detect and report inconsistencies
 
 ---
 
 ## Phase 3: Common Features
 
-### Zero Clusters (Simple - Common)
-- [ ] Detect zero flag in L2 entry (bit 0)
-- [ ] Return zeros without disk read
-- [ ] Write zero clusters (deallocate + set flag)
-- [ ] QCOW2_CLUSTER_ZERO_PLAIN vs ZERO_ALLOC
+### Zero Clusters ⚠️ (Partial)
+- [x] Detect zero flag in L2 entry (bit 0)
+- [x] Return zeros without disk read
+- [x] Write zero clusters (WriteZeroAt with ZERO_PLAIN mode)
+- [ ] QCOW2_CLUSTER_ZERO_ALLOC variant
 
-### Compression - Reading (Medium - Common)
+### Compression - Reading ⚠️ (Partial)
 - [x] Detect compressed L2 entries (bit 62)
 - [x] Parse compressed cluster offset/size
 - [x] Deflate decompression
-- [ ] Zstd decompression
+- [ ] **HIGH**: Zstd decompression
 - [ ] Handle compression type field (byte 104)
 
 ### Snapshots - Internal (Hard - Common)
@@ -86,12 +106,13 @@
 - [ ] Revert to snapshot
 - [ ] Reconstruct COPIED flag from refcounts
 
-### Header Extensions (Simple - Important)
-- [ ] Parse extension headers
-- [ ] Feature name table (0x6803f857)
-- [ ] Backing file format (0xe2792aca)
-- [ ] Ignore unknown compatible extensions
-- [ ] Fail on unknown incompatible extensions
+### Header Extensions ⚠️ (Partial)
+- [x] Parse extension headers
+- [x] Feature name table (0x6803f857)
+- [x] Backing file format (0xe2792aca)
+- [x] Ignore unknown compatible extensions
+- [x] Fail on unknown incompatible features (in Validate())
+- [ ] **FIX**: V2 extension parsing (currently skipped)
 
 ---
 
@@ -133,6 +154,48 @@
 
 ## Phase 5: Performance Optimization
 
+> **See REVIEW.md "Performance Analysis" for detailed profiling recommendations.**
+>
+> Current estimated performance: ~10-20% of qemu-img throughput.
+> Target: 2-5x improvement with optimizations below.
+
+### Profiling Commands (Added)
+```bash
+make profile-cpu      # CPU profiling
+make profile-mem      # Memory profiling
+make profile-all      # Both CPU and memory
+make profile-trace    # Execution tracer
+make profile-block    # Block profiling (goroutine contention)
+```
+
+### P0 - Critical Performance Issues (Do First)
+- [ ] **Eliminate L2 cache copy on hit** - Currently copies 64KB on every cache hit!
+  - Return slice directly with RWMutex protection
+  - Or use copy-on-write semantics
+  - **Impact: ~30% read improvement**
+- [ ] **Add refcount block cache** - Currently does disk I/O per refcount lookup
+  - Same pattern as L2 cache (16-32 entry LRU)
+  - **Impact: ~50% improvement for refcount operations**
+
+### P1 - High Impact Optimizations
+- [ ] **Batch fsync operations** - Currently 4 fsyncs per cluster allocation
+  - Defer syncs until Flush() or Close()
+  - Add BarrierBatched mode for collecting metadata updates
+  - **Impact: ~80% write improvement**
+- [ ] **Free cluster bitmap** - Currently O(n) scan for every allocation
+  - Maintain in-memory bitmap of free clusters
+  - O(1) allocation vs O(n)
+  - **Impact: Critical for images >10GB**
+- [ ] **sync.Pool for cluster buffers** - Currently allocates 64KB per operation
+  - Pre-allocate and reuse buffers
+  - **Impact: ~20% reduction in GC pressure**
+
+### P2 - Medium Priority Optimizations
+- [ ] Lock sharding for L2 cache (reduce contention)
+- [ ] Vectorized zero fill (use memclr instead of loop)
+- [ ] Cache statistics/metrics for observability
+- [ ] Configurable cache sizes
+
 ### L2 Cache Improvements
 - [ ] Configurable cache size
 - [ ] Sharded cache (reduce lock contention)
@@ -142,7 +205,6 @@
 
 ### Allocation Optimization
 - [ ] Cluster pre-allocation (slab allocator)
-- [ ] Free cluster bitmap
 - [ ] Contiguous allocation preference
 - [ ] Defragmentation support
 
@@ -176,27 +238,57 @@
 
 ---
 
-## E2E Test Suite (Priority)
+## E2E Test Suite ✅ COMPLETE
 
-### QEMU Interoperability Testing
+> **Comprehensive test plan**: See [todo_test_suite.md](todo_test_suite.md) for the full test suite design including fuzzing strategies, crash recovery testing, CI/CD integration, and implementation roadmap.
+
+### QEMU Interoperability Testing ✅
+- [x] Create images with `qemu-img` (various cluster sizes, versions)
+- [x] Write patterns with `qemu-io`
+- [x] Read QEMU images, verify checksums
+- [x] Write with our lib, verify with `qemu-img check`
+- [x] Round-trip: QEMU -> us -> QEMU
 - [ ] Docker/script to pull multiple QEMU versions (2.x, 5.x, 8.x)
-- [ ] Create images with `qemu-img` (various cluster sizes, versions)
-- [ ] Write patterns with `qemu-io`
-- [ ] Read QEMU images, verify checksums
-- [ ] Write with our lib, verify with `qemu-img check`
-- [ ] Round-trip: QEMU -> us -> QEMU
 
-### Fuzz Testing
-- [ ] Fuzz header parsing
-- [ ] Fuzz L2 table entries
-- [ ] Fuzz random offset read/write
+### Fuzz Testing ✅
+- [x] Fuzz header parsing
+- [x] Fuzz L2 table entries
+- [x] Fuzz random offset read/write
+- [x] Fuzz refcount entry read/write
+- [x] Fuzz full image opening
 - [ ] Fuzz concurrent access
 
 ### Crash Recovery Testing
 - [ ] Simulate crash during L2 allocation
 - [ ] Simulate crash during data write
-- [ ] Verify `qemu-img check -r` repairs our images
-- [ ] Verify we handle QEMU dirty images
+- [x] Verify `qemu-img check -r` repairs our images (lazy refcounts test)
+- [x] Verify we handle QEMU dirty images
+
+### Test Infrastructure
+- [ ] Add GitHub Actions CI workflow
+- [ ] Parallelize unit tests (t.Parallel())
+- [ ] Add benchmarks
+
+---
+
+## Code Quality (From Review)
+
+### Refactoring
+- [ ] Extract common L2 allocation code from getClusterForWrite/setZeroCluster
+- [ ] Split qcow2.go (1072 lines) into smaller modules
+- [ ] Remove unused `tableLen` field from l2Cache
+- [ ] Consider RWMutex for l2Cache.get() to improve read performance
+
+### Documentation
+- [ ] Document compressed L2 entry bit math in compress.go
+- [ ] Add spec references to format.go constants
+- [ ] Document Validate() limitations
+
+### Testing
+- [ ] Fix TestFreeClusterReuse to fail on no reuse
+- [ ] Fix TestCheckAfterWriteZero leak detection
+- [ ] Add cross-L1-boundary write tests
+- [ ] Add large image tests (>2GB)
 
 ---
 
@@ -210,20 +302,25 @@
 | L2 cache (LRU) | Essential | Simple | ✅ Done |
 | Image creation | Essential | Simple | ✅ Done |
 | Dirty/corrupt tracking | High | Simple | ✅ Done |
-| Zero cluster detection | Medium | Simple | ✅ Done |
+| Safety mechanisms | High | Medium | ✅ Done |
+| Zero cluster read | Medium | Simple | ✅ Done |
+| Zero cluster write | Medium | Simple | ✅ Done |
 | Refcount reading | Essential | Medium | ✅ Done |
 | Backing files (read) | High | Medium | ✅ Done |
 | Backing files (COW write) | High | Medium | ✅ Done |
-| Refcount updates | Essential | Hard | ⏳ Pending |
-| Lazy refcounts | High | Hard | ⏳ Pending |
-| Compression (read) | Medium | Medium | ✅ Done (deflate) |
+| Refcount updates | Essential | Hard | ⚠️ Works, needs optimization |
+| Lazy refcounts | High | Hard | ✅ Done |
+| Compression (read) | Medium | Medium | ⚠️ Deflate only |
 | Internal snapshots | Medium | Hard | ⏳ Pending |
-| Header extensions | Medium | Simple | ⏳ Pending |
+| Header extensions | Medium | Simple | ⚠️ V3 only |
 | Compression (write) | Low | Medium | ⏳ Pending |
 | Encryption | Low | Very Hard | ⏳ Pending |
 | Extended L2 | Low | Hard | ⏳ Pending |
 | Bitmaps/CBT | Low | Medium | ⏳ Pending |
 | External data files | Low | Medium | ⏳ Pending |
+| **E2E Test Suite** | High | Medium | ✅ Done |
+| **Critical Bug Fixes** | **Critical** | **Easy** | ⚠️ **Pending** |
+| **Performance (P0)** | **Critical** | **Medium** | ⚠️ **10-20% of qemu-img** |
 
 ---
 
@@ -232,7 +329,27 @@
 ### Design Decisions
 1. **Zero-struct L2 tables**: Keep as `[]byte`, access via `binary.BigEndian.Uint64`
 2. **LRU cache**: Simple doubly-linked list, returns copies to avoid races
-3. **Simple allocation**: Currently appends to file end, no reuse
+3. **Cluster allocation**: File-end growth with free cluster reuse via refcount scanning
+4. **Backing store interface**: `BackingStore` interface supports both qcow2 and raw backing files
+5. **Lazy refcounts**: Skip refcount updates during writes, rebuild from L1/L2 on dirty open; always grow file (no free cluster reuse) in lazy mode
+6. **Write ordering barriers**: Configurable via WriteBarrierMode (None/Metadata/Full); default is BarrierMetadata which syncs after metadata updates
+
+### Review Findings (2025-11-28)
+1. **Phase 2 should not be marked COMPLETE** - Several issues remain
+2. **itoa() helper is broken** - Critical test bug
+3. **No backing chain limit** - Security vulnerability
+4. **Refcount blocks not cached** - Performance issue
+5. **Dead code exists** - refcountTable struct, tableLen field
+6. See `REVIEW.md` for full analysis
+
+### Performance Findings (2025-11-28)
+1. **L2 cache copies 64KB on every hit** - Biggest performance issue
+2. **No refcount block cache** - Disk I/O per refcount lookup
+3. **4 fsyncs per cluster allocation** - Excessive with default barrier mode
+4. **O(n) free cluster search** - Unusable for large images
+5. **12+ syscalls per new cluster** - vs optimal 2-3
+6. **Estimated throughput: 10-20% of qemu-img**
+7. See `REVIEW.md` "Performance Analysis" section for detailed profiling
 
 ### Open Questions
 1. Should we support mmap for large images?

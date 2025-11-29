@@ -1,4 +1,4 @@
-.PHONY: all build test test-verbose test-race test-cover bench lint fmt vet clean check help qemu-test
+.PHONY: all build test test-verbose test-race test-cover bench lint fmt vet clean check help qemu-test fuzz fuzz-quick fuzz-medium fuzz-full test-all profile-cpu profile-mem profile-all profile-trace profile-block
 
 # Go parameters
 GOCMD=go
@@ -102,13 +102,74 @@ qemu-check:
 		qemu-img check $$f; \
 	done
 
-## fuzz: Run fuzz tests (Go 1.18+)
+## fuzz: Run all fuzz tests for 30s each (Go 1.18+)
 fuzz:
 	$(GOTEST) -fuzz=FuzzParseHeader -fuzztime=30s ./...
+	$(GOTEST) -fuzz=FuzzL2Entry -fuzztime=30s ./...
+	$(GOTEST) -fuzz=FuzzRefcountEntry -fuzztime=30s ./...
+
+## fuzz-quick: Quick fuzz tests (1 minute each, suitable for CI)
+fuzz-quick:
+	$(GOTEST) -fuzz=FuzzParseHeader -fuzztime=1m ./...
+	$(GOTEST) -fuzz=FuzzL2Entry -fuzztime=1m ./...
+
+## fuzz-medium: Medium fuzz tests (10 minutes each, suitable for PR merge)
+fuzz-medium:
+	$(GOTEST) -fuzz=FuzzParseHeader -fuzztime=10m ./...
+	$(GOTEST) -fuzz=FuzzL2Entry -fuzztime=10m ./...
+	$(GOTEST) -fuzz=FuzzRefcountEntry -fuzztime=10m ./...
+	$(GOTEST) -fuzz=FuzzReadWrite -fuzztime=10m ./...
+
+## fuzz-full: Full fuzz tests (1 hour each, suitable for nightly builds)
+fuzz-full:
+	$(GOTEST) -fuzz=FuzzParseHeader -fuzztime=1h ./...
+	$(GOTEST) -fuzz=FuzzL2Entry -fuzztime=1h ./...
+	$(GOTEST) -fuzz=FuzzRefcountEntry -fuzztime=1h ./...
+	$(GOTEST) -fuzz=FuzzReadWrite -fuzztime=1h ./...
+	$(GOTEST) -fuzz=FuzzFullImage -fuzztime=1h ./...
+
+## test-all: Run all tests including QEMU interop (requires qemu-img)
+test-all: test test-race qemu-test
 
 ## install-tools: Install development tools
 install-tools:
 	go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+
+## profile-cpu: Run benchmarks with CPU profiling
+profile-cpu:
+	@mkdir -p profiles
+	$(GOTEST) -bench=. -benchmem -cpuprofile=profiles/cpu.prof ./...
+	@echo "CPU profile written to profiles/cpu.prof"
+	@echo "View with: go tool pprof -http=:8080 profiles/cpu.prof"
+
+## profile-mem: Run benchmarks with memory profiling
+profile-mem:
+	@mkdir -p profiles
+	$(GOTEST) -bench=. -benchmem -memprofile=profiles/mem.prof ./...
+	@echo "Memory profile written to profiles/mem.prof"
+	@echo "View with: go tool pprof -http=:8080 profiles/mem.prof"
+
+## profile-all: Run benchmarks with CPU and memory profiling
+profile-all:
+	@mkdir -p profiles
+	$(GOTEST) -bench=. -benchmem -cpuprofile=profiles/cpu.prof -memprofile=profiles/mem.prof ./...
+	@echo "Profiles written to profiles/"
+	@echo "View CPU:    go tool pprof -http=:8080 profiles/cpu.prof"
+	@echo "View Memory: go tool pprof -http=:8081 profiles/mem.prof"
+
+## profile-trace: Run with execution tracer
+profile-trace:
+	@mkdir -p profiles
+	$(GOTEST) -bench=. -trace=profiles/trace.out ./...
+	@echo "Trace written to profiles/trace.out"
+	@echo "View with: go tool trace profiles/trace.out"
+
+## profile-block: Run with block profiling (shows where goroutines block)
+profile-block:
+	@mkdir -p profiles
+	$(GOTEST) -bench=. -blockprofile=profiles/block.prof ./...
+	@echo "Block profile written to profiles/block.prof"
+	@echo "View with: go tool pprof -http=:8080 profiles/block.prof"
 
 ## help: Show this help
 help:

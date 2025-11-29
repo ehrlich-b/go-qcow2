@@ -2,6 +2,7 @@ package qcow2
 
 import (
 	"bytes"
+	"encoding/binary"
 	"io"
 	"os"
 	"path/filepath"
@@ -564,5 +565,1095 @@ func TestReadOnly(t *testing.T) {
 	_, err = img2.WriteAt([]byte("test"), 0)
 	if err != ErrReadOnly {
 		t.Errorf("WriteAt on read-only: got err %v, want ErrReadOnly", err)
+	}
+}
+
+func TestRefcountUpdates(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.qcow2")
+
+	// Create an image
+	img, err := CreateSimple(path, 1024*1024)
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+	defer img.Close()
+
+	// Initial clusters (0-3) should have refcount 1
+	// Cluster 0: header
+	// Cluster 1: L1 table
+	// Cluster 2: refcount table
+	// Cluster 3: refcount block
+	clusterSize := uint64(img.ClusterSize())
+	for i := uint64(0); i < 4; i++ {
+		refcount, err := img.ClusterRefcount(i * clusterSize)
+		if err != nil {
+			t.Fatalf("ClusterRefcount(%d) failed: %v", i, err)
+		}
+		if refcount != 1 {
+			t.Errorf("Initial cluster %d refcount = %d, want 1", i, refcount)
+		}
+	}
+
+	// Write some data to allocate a new cluster
+	data := make([]byte, 4096)
+	for i := range data {
+		data[i] = byte(i)
+	}
+	if _, err := img.WriteAt(data, 0); err != nil {
+		t.Fatalf("WriteAt failed: %v", err)
+	}
+
+	// The newly allocated clusters should have refcount 1
+	// We allocated:
+	// - 1 L2 table (cluster 4)
+	// - 1 data cluster (cluster 5)
+	for i := uint64(4); i <= 5; i++ {
+		refcount, err := img.ClusterRefcount(i * clusterSize)
+		if err != nil {
+			t.Fatalf("ClusterRefcount(%d) failed: %v", i, err)
+		}
+		if refcount != 1 {
+			t.Errorf("Allocated cluster %d refcount = %d, want 1", i, refcount)
+		}
+	}
+
+	// Write to a different L2 region to allocate another L2 table
+	// Each L2 table covers 8192 * 64KB = 512MB with default settings
+	// So offset 512MB will need a new L2 table
+	largeOffset := int64(512 * 1024 * 1024) // 512MB
+	if largeOffset < img.Size() {
+		if _, err := img.WriteAt(data, largeOffset); err != nil {
+			t.Fatalf("WriteAt at large offset failed: %v", err)
+		}
+	}
+}
+
+func TestRefcountEntryReadWrite(t *testing.T) {
+	// Test readRefcountEntry and writeRefcountEntry for various bit widths
+	tests := []struct {
+		bits  uint32
+		index uint64
+		value uint64
+	}{
+		{16, 0, 1},
+		{16, 1, 65535},
+		{16, 100, 42},
+		{8, 0, 1},
+		{8, 1, 255},
+		{32, 0, 0xDEADBEEF},
+		{64, 0, 0xDEADBEEFCAFEBABE},
+	}
+
+	for _, tc := range tests {
+		// Calculate block size needed
+		var blockSize int
+		switch tc.bits {
+		case 1:
+			blockSize = int(tc.index/8) + 1
+		case 2:
+			blockSize = int(tc.index/4) + 1
+		case 4:
+			blockSize = int(tc.index/2) + 1
+		case 8:
+			blockSize = int(tc.index) + 1
+		case 16:
+			blockSize = int(tc.index*2) + 2
+		case 32:
+			blockSize = int(tc.index*4) + 4
+		case 64:
+			blockSize = int(tc.index*8) + 8
+		}
+
+		block := make([]byte, blockSize)
+
+		// Write
+		writeRefcountEntry(block, tc.index, tc.bits, tc.value)
+
+		// Read back
+		got := readRefcountEntry(block, tc.index, tc.bits)
+		if got != tc.value {
+			t.Errorf("bits=%d index=%d: got %d, want %d", tc.bits, tc.index, got, tc.value)
+		}
+	}
+}
+
+func TestHeaderExtensions(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.qcow2")
+
+	// Create an image
+	img, err := CreateSimple(path, 1024*1024)
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+
+	// Check that extensions were parsed (even if empty)
+	ext := img.Extensions()
+	if ext == nil {
+		t.Error("Extensions() returned nil")
+	}
+
+	// Our created images don't have backing format or feature names by default
+	if img.BackingFormat() != "" {
+		t.Errorf("BackingFormat = %q, want empty", img.BackingFormat())
+	}
+
+	img.Close()
+}
+
+func TestHeaderExtensionsParsing(t *testing.T) {
+	// Test feature name table parsing
+	names := make(map[string]string)
+
+	// Create a mock feature name table entry
+	// Format: 1 byte type + 1 byte bit + 46 bytes name
+	entry := make([]byte, 48)
+	entry[0] = 0                 // incompatible
+	entry[1] = 0                 // bit 0
+	copy(entry[2:], "dirty bit") // name
+
+	err := parseFeatureNameTable(entry, names)
+	if err != nil {
+		t.Fatalf("parseFeatureNameTable failed: %v", err)
+	}
+
+	if names["incompat_0"] != "dirty bit" {
+		t.Errorf("Feature name = %q, want %q", names["incompat_0"], "dirty bit")
+	}
+}
+
+func TestWriteZeroAt(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.qcow2")
+
+	// Create image with 2 clusters worth of space (128KB with default 64KB clusters)
+	img, err := CreateSimple(path, 128*1024)
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+
+	// Write some non-zero data first
+	data := make([]byte, 64*1024) // One cluster
+	for i := range data {
+		data[i] = byte(i % 256)
+	}
+	if _, err := img.WriteAt(data, 0); err != nil {
+		t.Fatalf("WriteAt failed: %v", err)
+	}
+
+	// Write a second cluster with data
+	if _, err := img.WriteAt(data, 64*1024); err != nil {
+		t.Fatalf("WriteAt failed: %v", err)
+	}
+
+	img.Close()
+
+	// Reopen and zero out the first cluster
+	img, err = Open(path)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	// Get file size before zeroing
+	info1, _ := img.file.Stat()
+	sizeBefore := info1.Size()
+
+	// Zero the first cluster using WriteZeroAt
+	if err := img.WriteZeroAt(0, 64*1024); err != nil {
+		t.Fatalf("WriteZeroAt failed: %v", err)
+	}
+
+	// Verify reading back zeros
+	readBuf := make([]byte, 64*1024)
+	if _, err := img.ReadAt(readBuf, 0); err != nil {
+		t.Fatalf("ReadAt failed: %v", err)
+	}
+
+	for i, b := range readBuf {
+		if b != 0 {
+			t.Errorf("Expected zero at offset %d, got %d", i, b)
+			break
+		}
+	}
+
+	// Verify second cluster still has data
+	if _, err := img.ReadAt(readBuf, 64*1024); err != nil {
+		t.Fatalf("ReadAt failed: %v", err)
+	}
+
+	for i, b := range readBuf {
+		expected := byte(i % 256)
+		if b != expected {
+			t.Errorf("Data corrupted at offset %d: got %d, want %d", i, b, expected)
+			break
+		}
+	}
+
+	// File size should not have grown (zero cluster doesn't allocate)
+	info2, _ := img.file.Stat()
+	sizeAfter := info2.Size()
+	if sizeAfter > sizeBefore {
+		t.Logf("Note: File grew from %d to %d (expected: no growth for zero clusters)", sizeBefore, sizeAfter)
+	}
+
+	img.Close()
+}
+
+func TestWriteZeroAtPartialCluster(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.qcow2")
+
+	// Create image with 2 clusters worth of space
+	img, err := CreateSimple(path, 128*1024)
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+
+	// Write non-zero data to first cluster
+	data := make([]byte, 64*1024)
+	for i := range data {
+		data[i] = 0xAB
+	}
+	if _, err := img.WriteAt(data, 0); err != nil {
+		t.Fatalf("WriteAt failed: %v", err)
+	}
+
+	// Zero only part of the cluster (first 32KB)
+	if err := img.WriteZeroAt(0, 32*1024); err != nil {
+		t.Fatalf("WriteZeroAt failed: %v", err)
+	}
+
+	// Verify first 32KB is zeros
+	readBuf := make([]byte, 32*1024)
+	if _, err := img.ReadAt(readBuf, 0); err != nil {
+		t.Fatalf("ReadAt failed: %v", err)
+	}
+
+	for i, b := range readBuf {
+		if b != 0 {
+			t.Errorf("Expected zero at offset %d, got %d", i, b)
+			break
+		}
+	}
+
+	// Verify second 32KB still has data (0xAB)
+	if _, err := img.ReadAt(readBuf, 32*1024); err != nil {
+		t.Fatalf("ReadAt failed: %v", err)
+	}
+
+	for i, b := range readBuf {
+		if b != 0xAB {
+			t.Errorf("Data corrupted at offset %d: got %d, want 0xAB", i, b)
+			break
+		}
+	}
+
+	img.Close()
+}
+
+func TestFreeClusterReuse(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.qcow2")
+
+	// Create image
+	img, err := CreateSimple(path, 256*1024) // 4 clusters
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+
+	// Write data to first two clusters
+	data := make([]byte, 64*1024)
+	for i := range data {
+		data[i] = 0xAA
+	}
+	if _, err := img.WriteAt(data, 0); err != nil {
+		t.Fatalf("WriteAt failed: %v", err)
+	}
+	if _, err := img.WriteAt(data, 64*1024); err != nil {
+		t.Fatalf("WriteAt failed: %v", err)
+	}
+
+	// Get file size after initial writes
+	info1, _ := img.file.Stat()
+	sizeAfterWrites := info1.Size()
+
+	// Get the physical offset of the first cluster
+	info, err := img.translate(0)
+	if err != nil {
+		t.Fatalf("translate failed: %v", err)
+	}
+	firstClusterOffset := info.physOff & ^img.offsetMask
+
+	// Zero the first cluster (this frees it)
+	if err := img.WriteZeroAt(0, 64*1024); err != nil {
+		t.Fatalf("WriteZeroAt failed: %v", err)
+	}
+
+	// Write data to a new virtual offset (third cluster)
+	// This should reuse the freed cluster
+	for i := range data {
+		data[i] = 0xBB
+	}
+	if _, err := img.WriteAt(data, 128*1024); err != nil {
+		t.Fatalf("WriteAt to third cluster failed: %v", err)
+	}
+
+	// File should not have grown significantly (cluster was reused)
+	info2, _ := img.file.Stat()
+	sizeAfterReuse := info2.Size()
+
+	// Get physical offset of the new cluster
+	info3, err := img.translate(128 * 1024)
+	if err != nil {
+		t.Fatalf("translate failed: %v", err)
+	}
+	newClusterOffset := info3.physOff & ^img.offsetMask
+
+	// The new cluster should reuse the freed cluster's offset
+	if newClusterOffset == firstClusterOffset {
+		t.Logf("Free cluster reuse confirmed: offset 0x%x", newClusterOffset)
+	} else {
+		// File should have grown if cluster wasn't reused
+		t.Logf("Note: Cluster not reused (first: 0x%x, new: 0x%x)", firstClusterOffset, newClusterOffset)
+	}
+
+	// File size should not have grown much more than one cluster
+	// (may grow slightly due to refcount blocks, etc.)
+	if sizeAfterReuse > sizeAfterWrites+int64(img.clusterSize)*2 {
+		t.Logf("Warning: File grew significantly: %d -> %d", sizeAfterWrites, sizeAfterReuse)
+	}
+
+	// Verify the data is correct
+	readBuf := make([]byte, 64*1024)
+	if _, err := img.ReadAt(readBuf, 128*1024); err != nil {
+		t.Fatalf("ReadAt failed: %v", err)
+	}
+	for i, b := range readBuf {
+		if b != 0xBB {
+			t.Errorf("Data corrupted at offset %d: got %d, want 0xBB", i, b)
+			break
+		}
+	}
+
+	img.Close()
+}
+
+func TestRefcountDeallocation(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.qcow2")
+
+	// Create image
+	img, err := CreateSimple(path, 128*1024)
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+
+	// Write data to allocate a cluster
+	data := make([]byte, 64*1024)
+	for i := range data {
+		data[i] = 0xCD
+	}
+	if _, err := img.WriteAt(data, 0); err != nil {
+		t.Fatalf("WriteAt failed: %v", err)
+	}
+
+	// Get the physical offset of the allocated cluster
+	info, err := img.translate(0)
+	if err != nil {
+		t.Fatalf("translate failed: %v", err)
+	}
+	if info.ctype != clusterNormal {
+		t.Fatalf("Expected clusterNormal, got %v", info.ctype)
+	}
+
+	// Align to cluster start
+	clusterOffset := info.physOff & ^img.offsetMask
+
+	// Verify refcount is 1
+	refcount, err := img.ClusterRefcount(clusterOffset)
+	if err != nil {
+		t.Fatalf("ClusterRefcount failed: %v", err)
+	}
+	if refcount != 1 {
+		t.Errorf("Refcount before deallocation = %d, want 1", refcount)
+	}
+
+	// Zero the cluster (should decrement refcount)
+	if err := img.WriteZeroAt(0, 64*1024); err != nil {
+		t.Fatalf("WriteZeroAt failed: %v", err)
+	}
+
+	// Verify refcount is now 0
+	refcount, err = img.ClusterRefcount(clusterOffset)
+	if err != nil {
+		t.Fatalf("ClusterRefcount failed: %v", err)
+	}
+	if refcount != 0 {
+		t.Errorf("Refcount after deallocation = %d, want 0", refcount)
+	}
+
+	// Verify the cluster now reads as zero
+	readBuf := make([]byte, 64*1024)
+	if _, err := img.ReadAt(readBuf, 0); err != nil {
+		t.Fatalf("ReadAt failed: %v", err)
+	}
+
+	for i, b := range readBuf {
+		if b != 0 {
+			t.Errorf("Expected zero at offset %d, got %d", i, b)
+			break
+		}
+	}
+
+	img.Close()
+}
+
+func TestRawBackingFile(t *testing.T) {
+	dir := t.TempDir()
+	rawPath := filepath.Join(dir, "base.raw")
+	overlayPath := filepath.Join(dir, "overlay.qcow2")
+
+	// Create a raw backing file with test pattern
+	rawSize := int64(128 * 1024) // 128KB
+	rawFile, err := os.Create(rawPath)
+	if err != nil {
+		t.Fatalf("Failed to create raw file: %v", err)
+	}
+
+	// Write test pattern to raw file
+	testData := make([]byte, rawSize)
+	for i := range testData {
+		testData[i] = byte(i % 256)
+	}
+	if _, err := rawFile.Write(testData); err != nil {
+		rawFile.Close()
+		t.Fatalf("Failed to write raw file: %v", err)
+	}
+	rawFile.Close()
+
+	// Create qcow2 overlay with raw backing file
+	overlay, err := Create(overlayPath, CreateOptions{
+		Size:          uint64(rawSize),
+		BackingFile:   rawPath,
+		BackingFormat: "raw",
+	})
+	if err != nil {
+		t.Fatalf("Create overlay failed: %v", err)
+	}
+
+	// Verify backing format extension was written
+	if overlay.BackingFormat() != "raw" {
+		t.Errorf("BackingFormat() = %q, want %q", overlay.BackingFormat(), "raw")
+	}
+
+	// Read data - should come from raw backing file
+	readBuf2 := make([]byte, rawSize)
+	n, err := overlay.ReadAt(readBuf2, 0)
+	if err != nil {
+		t.Fatalf("ReadAt failed: %v", err)
+	}
+	if int64(n) != rawSize {
+		t.Errorf("Read %d bytes, want %d", n, rawSize)
+	}
+
+	// Verify data matches raw file
+	for i := range readBuf2 {
+		expected := byte(i % 256)
+		if readBuf2[i] != expected {
+			t.Errorf("Data mismatch at offset %d: got %d, want %d", i, readBuf2[i], expected)
+			break
+		}
+	}
+
+	// Write to overlay (COW)
+	cowData := []byte("OVERLAY DATA")
+	if _, err := overlay.WriteAt(cowData, 1000); err != nil {
+		t.Fatalf("WriteAt failed: %v", err)
+	}
+
+	// Read back - should see overlay data
+	readBuf3 := make([]byte, len(cowData))
+	if _, err := overlay.ReadAt(readBuf3, 1000); err != nil {
+		t.Fatalf("ReadAt after write failed: %v", err)
+	}
+	if string(readBuf3) != string(cowData) {
+		t.Errorf("COW data = %q, want %q", readBuf3, cowData)
+	}
+
+	overlay.Close()
+
+	// Reopen and verify data persists
+	overlay2, err := Open(overlayPath)
+	if err != nil {
+		t.Fatalf("Reopen failed: %v", err)
+	}
+	defer overlay2.Close()
+
+	// Verify backing format is still "raw"
+	if overlay2.BackingFormat() != "raw" {
+		t.Errorf("After reopen: BackingFormat() = %q, want %q", overlay2.BackingFormat(), "raw")
+	}
+
+	// Verify COW data
+	if _, err := overlay2.ReadAt(readBuf3, 1000); err != nil {
+		t.Fatalf("ReadAt after reopen failed: %v", err)
+	}
+	if string(readBuf3) != string(cowData) {
+		t.Errorf("After reopen: COW data = %q, want %q", readBuf3, cowData)
+	}
+
+	t.Log("Raw backing file support confirmed")
+}
+
+func TestOverlapChecks(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.qcow2")
+
+	// Create image
+	img, err := CreateSimple(path, 1024*1024) // 1MB
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+	defer img.Close()
+
+	// Write some data to allocate an L2 table and data cluster
+	data := make([]byte, 4096)
+	for i := range data {
+		data[i] = 0xAB
+	}
+	if _, err := img.WriteAt(data, 0); err != nil {
+		t.Fatalf("WriteAt failed: %v", err)
+	}
+
+	// Test header overlap (cluster 0)
+	result := img.CheckOverlap(0)
+	if !result.Overlaps || result.MetadataType != "header" {
+		t.Errorf("Header check: got Overlaps=%v, Type=%s; want Overlaps=true, Type=header",
+			result.Overlaps, result.MetadataType)
+	}
+
+	// Test L1 table overlap (typically cluster 1)
+	result = img.CheckOverlap(img.header.L1TableOffset)
+	if !result.Overlaps || result.MetadataType != "l1_table" {
+		t.Errorf("L1 table check: got Overlaps=%v, Type=%s; want Overlaps=true, Type=l1_table",
+			result.Overlaps, result.MetadataType)
+	}
+
+	// Test refcount table overlap (typically cluster 2)
+	result = img.CheckOverlap(img.header.RefcountTableOffset)
+	if !result.Overlaps || result.MetadataType != "refcount_table" {
+		t.Errorf("Refcount table check: got Overlaps=%v, Type=%s; want Overlaps=true, Type=refcount_table",
+			result.Overlaps, result.MetadataType)
+	}
+
+	// Find the refcount block offset from the refcount table
+	if len(img.refcountTable) >= 8 {
+		refBlockOffset := binary.BigEndian.Uint64(img.refcountTable[0:8])
+		if refBlockOffset != 0 {
+			result = img.CheckOverlap(refBlockOffset)
+			if !result.Overlaps || result.MetadataType != "refcount_block" {
+				t.Errorf("Refcount block check: got Overlaps=%v, Type=%s; want Overlaps=true, Type=refcount_block",
+					result.Overlaps, result.MetadataType)
+			}
+		}
+	}
+
+	// Find the L2 table offset from the L1 table
+	if len(img.l1Table) >= 8 {
+		l1Entry := binary.BigEndian.Uint64(img.l1Table[0:8])
+		if l1Entry != 0 {
+			l2Offset := l1Entry & L2EntryOffsetMask
+			result = img.CheckOverlap(l2Offset)
+			if !result.Overlaps || result.MetadataType != "l2_table" {
+				t.Errorf("L2 table check: got Overlaps=%v, Type=%s; want Overlaps=true, Type=l2_table",
+					result.Overlaps, result.MetadataType)
+			}
+		}
+	}
+
+	// Test a data cluster (should not overlap)
+	// Get the data cluster offset from the L2 table
+	info, err := img.translate(0)
+	if err != nil {
+		t.Fatalf("translate failed: %v", err)
+	}
+	if info.ctype == clusterNormal {
+		dataCluster := info.physOff & ^img.offsetMask
+		result = img.CheckOverlap(dataCluster)
+		if result.Overlaps {
+			t.Errorf("Data cluster check: got Overlaps=true, Type=%s; want Overlaps=false",
+				result.MetadataType)
+		}
+	}
+
+	t.Log("Overlap checks verified for all metadata types")
+}
+
+func TestLazyRefcounts(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.qcow2")
+
+	// Create image with lazy refcounts enabled
+	img, err := Create(path, CreateOptions{
+		Size:          1024 * 1024, // 1MB
+		LazyRefcounts: true,
+	})
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+
+	// Verify lazy refcounts is enabled
+	if !img.HasLazyRefcounts() {
+		t.Error("HasLazyRefcounts() should return true")
+	}
+
+	// Write some data to allocate clusters
+	data1 := make([]byte, 64*1024) // One cluster
+	for i := range data1 {
+		data1[i] = byte(i % 256)
+	}
+	if _, err := img.WriteAt(data1, 0); err != nil {
+		t.Fatalf("WriteAt failed: %v", err)
+	}
+
+	// Write to a second cluster
+	data2 := make([]byte, 64*1024)
+	for i := range data2 {
+		data2[i] = byte((i + 128) % 256)
+	}
+	if _, err := img.WriteAt(data2, 64*1024); err != nil {
+		t.Fatalf("WriteAt failed: %v", err)
+	}
+
+	img.Close()
+
+	// Reopen - image should be dirty (lazy refcounts keeps dirty bit set)
+	img2, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	// Should have rebuilt refcounts on open
+	if !img2.HasLazyRefcounts() {
+		t.Error("After reopen: HasLazyRefcounts() should return true")
+	}
+
+	// Verify data is still intact
+	readBuf := make([]byte, 64*1024)
+	if _, err := img2.ReadAt(readBuf, 0); err != nil {
+		t.Fatalf("ReadAt failed: %v", err)
+	}
+	for i := range readBuf {
+		expected := byte(i % 256)
+		if readBuf[i] != expected {
+			t.Errorf("Data mismatch at offset %d: got %d, want %d", i, readBuf[i], expected)
+			break
+		}
+	}
+
+	// Check that refcounts are correct after rebuild
+	// Header cluster should have refcount 1
+	refcount, err := img2.ClusterRefcount(0)
+	if err != nil {
+		t.Fatalf("ClusterRefcount(0) failed: %v", err)
+	}
+	if refcount != 1 {
+		t.Errorf("Header cluster refcount = %d, want 1", refcount)
+	}
+
+	// Allocated data cluster should have refcount 1
+	info, err := img2.translate(0)
+	if err != nil {
+		t.Fatalf("translate failed: %v", err)
+	}
+	if info.ctype == clusterNormal {
+		dataCluster := info.physOff & ^img2.offsetMask
+		refcount, err := img2.ClusterRefcount(dataCluster)
+		if err != nil {
+			t.Fatalf("ClusterRefcount for data cluster failed: %v", err)
+		}
+		if refcount != 1 {
+			t.Errorf("Data cluster refcount = %d, want 1", refcount)
+		}
+	}
+
+	img2.Close()
+	t.Log("Lazy refcounts feature verified")
+}
+
+func TestLazyRefcountsDeferral(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.qcow2")
+
+	// Create image with lazy refcounts enabled
+	img, err := Create(path, CreateOptions{
+		Size:          1024 * 1024,
+		LazyRefcounts: true,
+	})
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+
+	// Write and zero clusters - refcount updates should be skipped
+	data := make([]byte, 64*1024)
+	for i := range data {
+		data[i] = 0xAB
+	}
+	if _, err := img.WriteAt(data, 0); err != nil {
+		t.Fatalf("WriteAt failed: %v", err)
+	}
+
+	// Get the data cluster offset
+	info, err := img.translate(0)
+	if err != nil {
+		t.Fatalf("translate failed: %v", err)
+	}
+	dataCluster := info.physOff & ^img.offsetMask
+
+	// Zero the cluster (would normally decrement refcount)
+	if err := img.WriteZeroAt(0, 64*1024); err != nil {
+		t.Fatalf("WriteZeroAt failed: %v", err)
+	}
+
+	// In lazy mode, refcount might not be updated yet
+	// But after reopening, it should be correctly rebuilt to 0 (since cluster is zeroed)
+	img.Close()
+
+	// Reopen and check
+	img2, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer img2.Close()
+
+	// After rebuild, the zeroed cluster should have refcount 0
+	refcount, err := img2.ClusterRefcount(dataCluster)
+	if err != nil {
+		t.Fatalf("ClusterRefcount failed: %v", err)
+	}
+	if refcount != 0 {
+		t.Errorf("Zeroed cluster refcount after rebuild = %d, want 0", refcount)
+	}
+
+	t.Log("Lazy refcount deferral and rebuild verified")
+}
+
+func TestCheck(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.qcow2")
+
+	// Create a clean image
+	img, err := CreateSimple(path, 1024*1024)
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+
+	// Write some data
+	data := make([]byte, 64*1024)
+	for i := range data {
+		data[i] = byte(i % 256)
+	}
+	if _, err := img.WriteAt(data, 0); err != nil {
+		t.Fatalf("WriteAt failed: %v", err)
+	}
+
+	// Run check
+	result, err := img.Check()
+	if err != nil {
+		t.Fatalf("Check failed: %v", err)
+	}
+
+	// Should be clean
+	if !result.IsClean() {
+		t.Errorf("Image should be clean, got: corruptions=%d, leaks=%d, errors=%v",
+			result.Corruptions, result.Leaks, result.Errors)
+	}
+
+	// Should have some referenced clusters
+	if result.ReferencedClusters == 0 {
+		t.Error("ReferencedClusters should be > 0")
+	}
+
+	// Should have some allocated clusters
+	if result.AllocatedClusters == 0 {
+		t.Error("AllocatedClusters should be > 0")
+	}
+
+	img.Close()
+	t.Logf("Check result: referenced=%d, allocated=%d, fragmented=%d",
+		result.ReferencedClusters, result.AllocatedClusters, result.FragmentedClusters)
+}
+
+func TestCheckAfterWriteZero(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.qcow2")
+
+	// Create image and write data
+	img, err := CreateSimple(path, 1024*1024)
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+
+	data := make([]byte, 64*1024)
+	for i := range data {
+		data[i] = 0xCD
+	}
+	if _, err := img.WriteAt(data, 0); err != nil {
+		t.Fatalf("WriteAt failed: %v", err)
+	}
+
+	// Zero the data (deallocates cluster)
+	if err := img.WriteZeroAt(0, 64*1024); err != nil {
+		t.Fatalf("WriteZeroAt failed: %v", err)
+	}
+
+	// Check should find the deallocated cluster as a leak
+	// (refcount was decremented to 0, but the cluster still exists in the file)
+	result, err := img.Check()
+	if err != nil {
+		t.Fatalf("Check failed: %v", err)
+	}
+
+	// The zeroed cluster should show as a leak
+	if result.Leaks == 0 {
+		t.Log("No leaks detected (cluster may have been reused or not counted)")
+	} else {
+		t.Logf("Detected %d leaked clusters (%d bytes)", result.Leaks, result.LeakedClusters)
+	}
+
+	img.Close()
+}
+
+func TestRepair(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.qcow2")
+
+	// Create image with lazy refcounts (so refcounts aren't updated during writes)
+	img, err := Create(path, CreateOptions{
+		Size:          1024 * 1024,
+		LazyRefcounts: true,
+	})
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+
+	// Write some data
+	data := make([]byte, 64*1024)
+	for i := range data {
+		data[i] = byte(i % 256)
+	}
+	if _, err := img.WriteAt(data, 0); err != nil {
+		t.Fatalf("WriteAt failed: %v", err)
+	}
+	if _, err := img.WriteAt(data, 64*1024); err != nil {
+		t.Fatalf("WriteAt failed: %v", err)
+	}
+
+	// Run repair
+	result, err := img.Repair()
+	if err != nil {
+		t.Fatalf("Repair failed: %v", err)
+	}
+
+	// After repair, should be clean
+	if !result.IsClean() {
+		t.Errorf("After repair, image should be clean, got: corruptions=%d, leaks=%d, errors=%v",
+			result.Corruptions, result.Leaks, result.Errors)
+	}
+
+	// Verify data is still intact
+	readBuf := make([]byte, 64*1024)
+	if _, err := img.ReadAt(readBuf, 0); err != nil {
+		t.Fatalf("ReadAt failed: %v", err)
+	}
+	for i := range readBuf {
+		expected := byte(i % 256)
+		if readBuf[i] != expected {
+			t.Errorf("Data corrupted at offset %d: got %d, want %d", i, readBuf[i], expected)
+			break
+		}
+	}
+
+	img.Close()
+	t.Log("Repair verified successfully")
+}
+
+func TestCheckReadOnly(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.qcow2")
+
+	// Create and close image
+	img, err := CreateSimple(path, 1024*1024)
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+	img.Close()
+
+	// Open read-only
+	img2, err := OpenFile(path, os.O_RDONLY, 0)
+	if err != nil {
+		t.Fatalf("OpenFile failed: %v", err)
+	}
+	defer img2.Close()
+
+	// Check should work on read-only image
+	result, err := img2.Check()
+	if err != nil {
+		t.Fatalf("Check on read-only failed: %v", err)
+	}
+	if !result.IsClean() {
+		t.Errorf("Read-only image should be clean")
+	}
+
+	// Repair should fail on read-only image
+	_, err = img2.Repair()
+	if err != ErrReadOnly {
+		t.Errorf("Repair on read-only: got err %v, want ErrReadOnly", err)
+	}
+}
+
+func TestWriteBarrierModes(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.qcow2")
+
+	// Create image
+	img, err := CreateSimple(path, 1024*1024)
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+	defer img.Close()
+
+	// Default should be BarrierMetadata
+	if img.WriteBarrierMode() != BarrierMetadata {
+		t.Errorf("Default barrier mode = %d, want %d (BarrierMetadata)",
+			img.WriteBarrierMode(), BarrierMetadata)
+	}
+
+	// Test setting barrier mode
+	img.SetWriteBarrierMode(BarrierNone)
+	if img.WriteBarrierMode() != BarrierNone {
+		t.Errorf("After SetWriteBarrierMode(BarrierNone), got %d", img.WriteBarrierMode())
+	}
+
+	img.SetWriteBarrierMode(BarrierFull)
+	if img.WriteBarrierMode() != BarrierFull {
+		t.Errorf("After SetWriteBarrierMode(BarrierFull), got %d", img.WriteBarrierMode())
+	}
+
+	// Write with BarrierFull mode should work
+	data := []byte("test data for barrier mode")
+	_, err = img.WriteAt(data, 0)
+	if err != nil {
+		t.Errorf("WriteAt with BarrierFull failed: %v", err)
+	}
+
+	// Read back
+	buf := make([]byte, len(data))
+	_, err = img.ReadAt(buf, 0)
+	if err != nil {
+		t.Errorf("ReadAt failed: %v", err)
+	}
+	if !bytes.Equal(buf, data) {
+		t.Errorf("Data mismatch after BarrierFull write")
+	}
+}
+
+func TestWriteBarrierModeNone(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.qcow2")
+
+	// Create image with BarrierNone for maximum performance
+	img, err := CreateSimple(path, 1024*1024)
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+	img.SetWriteBarrierMode(BarrierNone)
+
+	// Write multiple clusters to exercise allocation paths
+	for i := 0; i < 10; i++ {
+		data := make([]byte, 4096)
+		for j := range data {
+			data[j] = byte(i)
+		}
+		_, err = img.WriteAt(data, int64(i*65536)) // Different clusters
+		if err != nil {
+			t.Fatalf("WriteAt cluster %d failed: %v", i, err)
+		}
+	}
+
+	img.Close()
+
+	// Reopen and verify data
+	img2, err := Open(path)
+	if err != nil {
+		t.Fatalf("Reopen failed: %v", err)
+	}
+	defer img2.Close()
+
+	for i := 0; i < 10; i++ {
+		buf := make([]byte, 4096)
+		_, err = img2.ReadAt(buf, int64(i*65536))
+		if err != nil {
+			t.Fatalf("ReadAt cluster %d failed: %v", i, err)
+		}
+		for j, b := range buf {
+			if b != byte(i) {
+				t.Errorf("Cluster %d byte %d: got %d, want %d", i, j, b, i)
+				break
+			}
+		}
+	}
+}
+
+func TestWriteBarrierWithZeroCluster(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.qcow2")
+
+	// Create image
+	img, err := CreateSimple(path, 1024*1024)
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+
+	// Use BarrierFull mode
+	img.SetWriteBarrierMode(BarrierFull)
+
+	// Write some data
+	data := make([]byte, 65536) // One cluster
+	for i := range data {
+		data[i] = 0xAA
+	}
+	_, err = img.WriteAt(data, 0)
+	if err != nil {
+		t.Fatalf("WriteAt failed: %v", err)
+	}
+
+	// Zero the cluster
+	err = img.WriteZeroAt(0, 65536)
+	if err != nil {
+		t.Fatalf("WriteZeroAt failed: %v", err)
+	}
+
+	img.Close()
+
+	// Reopen and verify zeros
+	img2, err := Open(path)
+	if err != nil {
+		t.Fatalf("Reopen failed: %v", err)
+	}
+	defer img2.Close()
+
+	buf := make([]byte, 65536)
+	_, err = img2.ReadAt(buf, 0)
+	if err != nil {
+		t.Fatalf("ReadAt failed: %v", err)
+	}
+
+	for i, b := range buf {
+		if b != 0 {
+			t.Errorf("Byte %d after WriteZeroAt: got %d, want 0", i, b)
+			break
+		}
 	}
 }

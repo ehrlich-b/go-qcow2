@@ -24,6 +24,10 @@ type CreateOptions struct {
 
 	// BackingFile is the path to a backing file for COW chains.
 	BackingFile string
+
+	// BackingFormat specifies the format of the backing file (e.g., "qcow2", "raw").
+	// If empty and BackingFile is set, defaults to "qcow2".
+	BackingFormat string
 }
 
 // Create creates a new QCOW2 image file.
@@ -88,12 +92,29 @@ func Create(path string, opts CreateOptions) (*Image, error) {
 	// For simplicity, start with 1 cluster for refcount table
 	refcountTableClusters := uint32(1)
 
+	// Calculate extension area size
+	extensionAreaOffset := uint64(headerLength)
+	extensionAreaSize := uint64(0)
+
+	// Backing format extension (if backing file with format specified)
+	if opts.BackingFile != "" && opts.BackingFormat != "" {
+		// Extension header: 4 bytes type + 4 bytes length + data + padding to 8 bytes
+		extDataLen := len(opts.BackingFormat)
+		extPaddedLen := (extDataLen + 7) & ^7
+		extensionAreaSize += 8 + uint64(extPaddedLen) // type + len + padded data
+	}
+
+	// End-of-header marker (8 bytes: type=0 + length=0)
+	if extensionAreaSize > 0 {
+		extensionAreaSize += 8
+	}
+
 	// Handle backing file
 	var backingFileOffset uint64
 	var backingFileSize uint32
 	if opts.BackingFile != "" {
-		// Backing file path goes right after the header
-		backingFileOffset = uint64(headerLength)
+		// Backing file path goes after extensions
+		backingFileOffset = extensionAreaOffset + extensionAreaSize
 		backingFileSize = uint32(len(opts.BackingFile))
 	}
 
@@ -129,6 +150,41 @@ func Create(path string, opts CreateOptions) (*Image, error) {
 		f.Close()
 		os.Remove(path)
 		return nil, fmt.Errorf("qcow2: failed to write header: %w", err)
+	}
+
+	// Write header extensions if needed
+	if opts.BackingFile != "" && opts.BackingFormat != "" {
+		extOffset := int64(extensionAreaOffset)
+
+		// Write backing format extension
+		extHeader := make([]byte, 8)
+		binary.BigEndian.PutUint32(extHeader[0:4], ExtensionBackingFormat)
+		binary.BigEndian.PutUint32(extHeader[4:8], uint32(len(opts.BackingFormat)))
+		if _, err := f.WriteAt(extHeader, extOffset); err != nil {
+			f.Close()
+			os.Remove(path)
+			return nil, fmt.Errorf("qcow2: failed to write backing format extension header: %w", err)
+		}
+		extOffset += 8
+
+		// Write extension data (padded to 8-byte boundary)
+		extPaddedLen := (len(opts.BackingFormat) + 7) & ^7
+		extData := make([]byte, extPaddedLen)
+		copy(extData, opts.BackingFormat)
+		if _, err := f.WriteAt(extData, extOffset); err != nil {
+			f.Close()
+			os.Remove(path)
+			return nil, fmt.Errorf("qcow2: failed to write backing format extension data: %w", err)
+		}
+		extOffset += int64(extPaddedLen)
+
+		// Write end-of-header marker
+		endMarker := make([]byte, 8) // All zeros = end marker
+		if _, err := f.WriteAt(endMarker, extOffset); err != nil {
+			f.Close()
+			os.Remove(path)
+			return nil, fmt.Errorf("qcow2: failed to write end-of-header marker: %w", err)
+		}
 	}
 
 	// Write backing file path if specified

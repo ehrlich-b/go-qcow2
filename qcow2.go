@@ -8,6 +8,12 @@ import (
 	"sync"
 )
 
+// BackingStore is the interface for backing files (qcow2 or raw).
+type BackingStore interface {
+	io.ReaderAt
+	io.Closer
+}
+
 // Image is the primary interface for interacting with a QCOW2 image.
 // It implements io.ReaderAt and io.WriterAt for random access.
 type Image struct {
@@ -39,8 +45,47 @@ type Image struct {
 	readOnly bool
 	dirty    bool
 
+	// Lazy refcounts mode - defer refcount updates for better write performance
+	lazyRefcounts bool
+
+	// Free cluster tracking - hint for next free cluster search
+	freeClusterHint uint64
+
 	// Backing file for COW chains
-	backing *Image
+	backing BackingStore
+
+	// Header extensions
+	extensions *HeaderExtensions
+
+	// Write ordering barrier mode
+	barrierMode WriteBarrierMode
+}
+
+// metadataBarrier issues a sync if barrier mode requires it for metadata updates.
+func (img *Image) metadataBarrier() error {
+	if img.barrierMode >= BarrierMetadata {
+		return img.file.Sync()
+	}
+	return nil
+}
+
+// dataBarrier issues a sync if barrier mode requires it for data writes.
+func (img *Image) dataBarrier() error {
+	if img.barrierMode >= BarrierFull {
+		return img.file.Sync()
+	}
+	return nil
+}
+
+// SetWriteBarrierMode sets the write ordering barrier mode.
+// This can be changed at any time; the new mode applies to subsequent writes.
+func (img *Image) SetWriteBarrierMode(mode WriteBarrierMode) {
+	img.barrierMode = mode
+}
+
+// WriteBarrierMode returns the current write ordering barrier mode.
+func (img *Image) WriteBarrierMode() WriteBarrierMode {
+	return img.barrierMode
 }
 
 // Open opens an existing QCOW2 image file.
@@ -86,13 +131,15 @@ func newImage(f *os.File, readOnly bool) (*Image, error) {
 	}
 
 	img := &Image{
-		file:        f,
-		header:      header,
-		clusterSize: header.ClusterSize(),
-		clusterBits: header.ClusterBits,
-		l2Entries:   header.L2Entries(),
-		offsetMask:  header.ClusterSize() - 1,
-		readOnly:    readOnly,
+		file:          f,
+		header:        header,
+		clusterSize:   header.ClusterSize(),
+		clusterBits:   header.ClusterBits,
+		l2Entries:     header.L2Entries(),
+		offsetMask:    header.ClusterSize() - 1,
+		readOnly:      readOnly,
+		lazyRefcounts: header.HasLazyRefcounts(),
+		barrierMode:   BarrierMetadata, // Default: sync after metadata updates
 	}
 
 	// Calculate l2Bits (log2 of l2Entries)
@@ -109,12 +156,26 @@ func newImage(f *os.File, readOnly bool) (*Image, error) {
 	// Initialize compressed cluster cache (default 16 entries)
 	img.compressedCache = newCompressedClusterCache(16, int(img.clusterSize))
 
+	// If lazy refcounts enabled and image is dirty, rebuild refcounts
+	if !readOnly && header.HasLazyRefcounts() && header.IsDirty() {
+		if err := img.rebuildRefcounts(); err != nil {
+			return nil, fmt.Errorf("qcow2: failed to rebuild refcounts: %w", err)
+		}
+	}
+
 	// Mark image dirty if opened for writing (v3 only)
 	if !readOnly && header.Version >= Version3 {
 		if err := img.markDirty(); err != nil {
 			return nil, fmt.Errorf("qcow2: failed to mark image dirty: %w", err)
 		}
 	}
+
+	// Parse header extensions
+	extensions, err := img.parseHeaderExtensions()
+	if err != nil {
+		return nil, fmt.Errorf("qcow2: failed to parse header extensions: %w", err)
+	}
+	img.extensions = extensions
 
 	// Open backing file if present
 	if err := img.openBackingFile(); err != nil {
@@ -445,6 +506,12 @@ func (img *Image) getClusterForWrite(virtOff uint64) (uint64, error) {
 			return 0, err
 		}
 
+		// Barrier: ensure L2 table is on disk before L1 points to it
+		if err := img.metadataBarrier(); err != nil {
+			img.l1Mu.Unlock()
+			return 0, fmt.Errorf("qcow2: L2 table barrier failed: %w", err)
+		}
+
 		// Update L1 entry with COPIED flag set
 		newL1Entry := l2TableOff | L1EntryCopied
 		binary.BigEndian.PutUint64(img.l1Table[l1Index*8:], newL1Entry)
@@ -454,6 +521,12 @@ func (img *Image) getClusterForWrite(virtOff uint64) (uint64, error) {
 			int64(img.header.L1TableOffset+l1Index*8)); err != nil {
 			img.l1Mu.Unlock()
 			return 0, err
+		}
+
+		// Barrier: ensure L1 update is on disk
+		if err := img.metadataBarrier(); err != nil {
+			img.l1Mu.Unlock()
+			return 0, fmt.Errorf("qcow2: L1 update barrier failed: %w", err)
 		}
 	}
 	img.l1Mu.Unlock()
@@ -490,6 +563,11 @@ func (img *Image) getClusterForWrite(virtOff uint64) (uint64, error) {
 			if _, err := img.file.WriteAt(clusterData, int64(physOff)); err != nil {
 				return 0, fmt.Errorf("qcow2: COW write failed: %w", err)
 			}
+
+			// Barrier: ensure COW data is on disk before L2 points to it
+			if err := img.dataBarrier(); err != nil {
+				return 0, fmt.Errorf("qcow2: COW data barrier failed: %w", err)
+			}
 		}
 
 		// Update L2 entry with COPIED flag
@@ -502,6 +580,11 @@ func (img *Image) getClusterForWrite(virtOff uint64) (uint64, error) {
 			return 0, err
 		}
 
+		// Barrier: ensure L2 update is on disk
+		if err := img.metadataBarrier(); err != nil {
+			return 0, fmt.Errorf("qcow2: L2 update barrier failed: %w", err)
+		}
+
 		// Update cache
 		img.l2Cache.put(l2TableOff, l2Table)
 	}
@@ -511,9 +594,31 @@ func (img *Image) getClusterForWrite(virtOff uint64) (uint64, error) {
 }
 
 // allocateCluster finds and allocates a new cluster.
-// This is a simple implementation that grows the file.
+// First tries to reuse a free cluster (refcount == 0), then grows the file.
+// It also updates the refcount for the new cluster.
 func (img *Image) allocateCluster() (uint64, error) {
-	// Get current file size (new cluster will be at the end)
+	// In lazy refcounts mode, skip free cluster search - always grow file.
+	// This is because refcounts aren't updated in lazy mode, so we can't
+	// reliably determine which clusters are free.
+	if !img.lazyRefcounts {
+		// Try to find a free cluster first
+		if offset, found := img.findFreeCluster(); found {
+			// Zero the cluster before reuse
+			zeros := make([]byte, img.clusterSize)
+			if _, err := img.file.WriteAt(zeros, int64(offset)); err != nil {
+				return 0, err
+			}
+
+			// Update refcount for the reused cluster
+			if err := img.incrementRefcount(offset); err != nil {
+				return 0, fmt.Errorf("qcow2: failed to update refcount for reused cluster: %w", err)
+			}
+
+			return offset, nil
+		}
+	}
+
+	// No free clusters found, grow the file
 	info, err := img.file.Stat()
 	if err != nil {
 		return 0, err
@@ -530,7 +635,226 @@ func (img *Image) allocateCluster() (uint64, error) {
 		return 0, err
 	}
 
+	// Update refcount for the new cluster
+	if err := img.incrementRefcount(offset); err != nil {
+		return 0, fmt.Errorf("qcow2: failed to update refcount for new cluster: %w", err)
+	}
+
 	return offset, nil
+}
+
+// findFreeCluster searches for a cluster with refcount == 0.
+// It starts from freeClusterHint and scans forward.
+// Returns the cluster offset and true if found, or 0 and false if none available.
+func (img *Image) findFreeCluster() (uint64, bool) {
+	if err := img.loadRefcountTable(); err != nil {
+		return 0, false
+	}
+
+	// Calculate minimum cluster index (skip header and metadata)
+	// Start after the first few clusters which contain header, L1, refcount table
+	minCluster := uint64(4) // Skip first 4 clusters as they likely contain metadata
+
+	// Use hint as starting point, or start from minCluster
+	startCluster := img.freeClusterHint
+	if startCluster < minCluster {
+		startCluster = minCluster
+	}
+
+	// Calculate maximum cluster index based on file size
+	info, err := img.file.Stat()
+	if err != nil {
+		return 0, false
+	}
+	maxCluster := uint64(info.Size()) >> img.clusterBits
+	if maxCluster == 0 {
+		return 0, false
+	}
+
+	// Search from startCluster to maxCluster
+	for clusterIdx := startCluster; clusterIdx < maxCluster; clusterIdx++ {
+		refcount, err := img.getRefcount(clusterIdx << img.clusterBits)
+		if err != nil {
+			continue
+		}
+		if refcount == 0 {
+			// Verify this isn't overlapping with metadata
+			clusterOff := clusterIdx << img.clusterBits
+			if !img.isMetadataCluster(clusterOff) {
+				img.freeClusterHint = clusterIdx + 1
+				return clusterOff, true
+			}
+		}
+	}
+
+	// Wrap around: search from minCluster to startCluster
+	for clusterIdx := minCluster; clusterIdx < startCluster && clusterIdx < maxCluster; clusterIdx++ {
+		refcount, err := img.getRefcount(clusterIdx << img.clusterBits)
+		if err != nil {
+			continue
+		}
+		if refcount == 0 {
+			clusterOff := clusterIdx << img.clusterBits
+			if !img.isMetadataCluster(clusterOff) {
+				img.freeClusterHint = clusterIdx + 1
+				return clusterOff, true
+			}
+		}
+	}
+
+	return 0, false
+}
+
+// isMetadataCluster checks if a cluster offset contains QCOW2 metadata.
+// Returns true for header, L1 table, L2 tables, refcount table, and refcount blocks.
+func (img *Image) isMetadataCluster(offset uint64) bool {
+	// Align offset to cluster boundary
+	clusterOffset := offset & ^img.offsetMask
+
+	// Header cluster
+	if clusterOffset < img.clusterSize {
+		return true
+	}
+
+	// L1 table
+	l1Start := img.header.L1TableOffset & ^img.offsetMask
+	l1Size := uint64(img.header.L1Size) * 8
+	if l1Size > 0 {
+		l1LastByte := img.header.L1TableOffset + l1Size - 1
+		l1EndCluster := l1LastByte & ^img.offsetMask
+		if clusterOffset >= l1Start && clusterOffset <= l1EndCluster {
+			return true
+		}
+	}
+
+	// Refcount table
+	refStart := img.header.RefcountTableOffset & ^img.offsetMask
+	refSize := uint64(img.header.RefcountTableClusters) * img.clusterSize
+	if clusterOffset >= refStart && clusterOffset < refStart+refSize {
+		return true
+	}
+
+	// Check if it's an L2 table (scan L1 entries)
+	if img.isL2TableCluster(clusterOffset) {
+		return true
+	}
+
+	// Check if it's a refcount block (scan refcount table entries)
+	if img.isRefcountBlockCluster(clusterOffset) {
+		return true
+	}
+
+	return false
+}
+
+// isL2TableCluster checks if an offset points to an L2 table cluster.
+func (img *Image) isL2TableCluster(offset uint64) bool {
+	if len(img.l1Table) == 0 {
+		return false
+	}
+
+	l1Entries := uint64(img.header.L1Size)
+	for i := uint64(0); i < l1Entries; i++ {
+		l1Entry := binary.BigEndian.Uint64(img.l1Table[i*8:])
+		if l1Entry == 0 {
+			continue
+		}
+		l2Offset := l1Entry & L2EntryOffsetMask
+		l2ClusterStart := l2Offset & ^img.offsetMask
+		if offset >= l2ClusterStart && offset < l2ClusterStart+img.clusterSize {
+			return true
+		}
+	}
+	return false
+}
+
+// isRefcountBlockCluster checks if an offset points to a refcount block cluster.
+func (img *Image) isRefcountBlockCluster(offset uint64) bool {
+	if len(img.refcountTable) == 0 {
+		return false
+	}
+
+	tableEntries := uint64(len(img.refcountTable)) / 8
+	for i := uint64(0); i < tableEntries; i++ {
+		blockOffset := binary.BigEndian.Uint64(img.refcountTable[i*8:])
+		if blockOffset == 0 {
+			continue
+		}
+		blockClusterStart := blockOffset & ^img.offsetMask
+		if offset >= blockClusterStart && offset < blockClusterStart+img.clusterSize {
+			return true
+		}
+	}
+	return false
+}
+
+// OverlapCheckResult describes what type of metadata a host offset overlaps with.
+type OverlapCheckResult struct {
+	Overlaps       bool
+	MetadataType   string // "header", "l1_table", "l2_table", "refcount_table", "refcount_block", or ""
+	MetadataOffset uint64
+}
+
+// CheckOverlap checks if a host offset overlaps with any QCOW2 metadata.
+// This is useful for debugging and verification.
+func (img *Image) CheckOverlap(hostOffset uint64) OverlapCheckResult {
+	clusterOffset := hostOffset & ^img.offsetMask
+
+	// Header cluster
+	if clusterOffset < img.clusterSize {
+		return OverlapCheckResult{Overlaps: true, MetadataType: "header", MetadataOffset: 0}
+	}
+
+	// L1 table
+	l1Start := img.header.L1TableOffset & ^img.offsetMask
+	l1Size := uint64(img.header.L1Size) * 8
+	if l1Size > 0 {
+		l1LastByte := img.header.L1TableOffset + l1Size - 1
+		l1EndCluster := l1LastByte & ^img.offsetMask
+		if clusterOffset >= l1Start && clusterOffset <= l1EndCluster {
+			return OverlapCheckResult{Overlaps: true, MetadataType: "l1_table", MetadataOffset: img.header.L1TableOffset}
+		}
+	}
+
+	// Refcount table
+	refStart := img.header.RefcountTableOffset & ^img.offsetMask
+	refSize := uint64(img.header.RefcountTableClusters) * img.clusterSize
+	if clusterOffset >= refStart && clusterOffset < refStart+refSize {
+		return OverlapCheckResult{Overlaps: true, MetadataType: "refcount_table", MetadataOffset: img.header.RefcountTableOffset}
+	}
+
+	// L2 tables
+	if len(img.l1Table) > 0 {
+		l1Entries := uint64(img.header.L1Size)
+		for i := uint64(0); i < l1Entries; i++ {
+			l1Entry := binary.BigEndian.Uint64(img.l1Table[i*8:])
+			if l1Entry == 0 {
+				continue
+			}
+			l2Offset := l1Entry & L2EntryOffsetMask
+			l2ClusterStart := l2Offset & ^img.offsetMask
+			if clusterOffset >= l2ClusterStart && clusterOffset < l2ClusterStart+img.clusterSize {
+				return OverlapCheckResult{Overlaps: true, MetadataType: "l2_table", MetadataOffset: l2Offset}
+			}
+		}
+	}
+
+	// Refcount blocks
+	if len(img.refcountTable) > 0 {
+		tableEntries := uint64(len(img.refcountTable)) / 8
+		for i := uint64(0); i < tableEntries; i++ {
+			blockOffset := binary.BigEndian.Uint64(img.refcountTable[i*8:])
+			if blockOffset == 0 {
+				continue
+			}
+			blockClusterStart := blockOffset & ^img.offsetMask
+			if clusterOffset >= blockClusterStart && clusterOffset < blockClusterStart+img.clusterSize {
+				return OverlapCheckResult{Overlaps: true, MetadataType: "refcount_block", MetadataOffset: blockOffset}
+			}
+		}
+	}
+
+	return OverlapCheckResult{Overlaps: false}
 }
 
 // Flush syncs all pending writes to disk.
@@ -545,14 +869,16 @@ func (img *Image) Flush() error {
 }
 
 // Close closes the image file.
-// On clean close, the dirty bit is cleared.
+// On clean close, the dirty bit is cleared (unless lazy refcounts are enabled,
+// in which case the image stays dirty and refcounts are rebuilt on next open).
 func (img *Image) Close() error {
 	if err := img.Flush(); err != nil {
 		return err
 	}
 
 	// Clear dirty bit on clean close (v3 only, RW only)
-	if !img.readOnly && img.header.Version >= Version3 {
+	// Skip if lazy refcounts is enabled - keep dirty bit for refcount rebuild
+	if !img.readOnly && img.header.Version >= Version3 && !img.lazyRefcounts {
 		if err := img.clearDirty(); err != nil {
 			// Log but don't fail - data is already flushed
 			// The image will just need repair on next open
@@ -576,4 +902,170 @@ func (img *Image) Header() Header {
 // A dirty image was not cleanly closed and may need repair.
 func (img *Image) IsDirty() bool {
 	return img.header.IsDirty()
+}
+
+// WriteZeroAt writes zeros efficiently using the zero cluster flag.
+// This avoids allocating storage for all-zero data.
+// It writes zeros from offset off for length bytes.
+func (img *Image) WriteZeroAt(off int64, length int64) error {
+	if img.readOnly {
+		return ErrReadOnly
+	}
+
+	if off < 0 {
+		return ErrOffsetOutOfRange
+	}
+
+	size := img.Size()
+	if off >= size {
+		return ErrOffsetOutOfRange
+	}
+
+	// Clamp to image size
+	if off+length > size {
+		length = size - off
+	}
+
+	for length > 0 {
+		// Calculate cluster boundaries
+		clusterStart := uint64(off) & ^img.offsetMask
+		clusterOff := uint64(off) & img.offsetMask
+
+		// If this is a partial cluster at the start, we need to do partial zero
+		if clusterOff != 0 {
+			// Partial cluster - use regular write with zeros
+			toWrite := img.clusterSize - clusterOff
+			if toWrite > uint64(length) {
+				toWrite = uint64(length)
+			}
+			zeros := make([]byte, toWrite)
+			if _, err := img.WriteAt(zeros, off); err != nil {
+				return err
+			}
+			off += int64(toWrite)
+			length -= int64(toWrite)
+			continue
+		}
+
+		// Full cluster - use zero flag
+		if uint64(length) >= img.clusterSize {
+			if err := img.setZeroCluster(clusterStart); err != nil {
+				return err
+			}
+			off += int64(img.clusterSize)
+			length -= int64(img.clusterSize)
+			continue
+		}
+
+		// Partial cluster at the end
+		zeros := make([]byte, length)
+		if _, err := img.WriteAt(zeros, off); err != nil {
+			return err
+		}
+		break
+	}
+
+	img.dirty = true
+	return nil
+}
+
+// setZeroCluster marks a cluster as zero without allocating storage.
+// This is the ZERO_PLAIN mode - the cluster offset is cleared.
+func (img *Image) setZeroCluster(virtOff uint64) error {
+	// Calculate L1 and L2 indices
+	l2Index := (virtOff >> img.clusterBits) & (img.l2Entries - 1)
+	l1Index := virtOff >> (img.clusterBits + img.l2Bits)
+
+	// Ensure L1 table is large enough
+	if l1Index >= uint64(img.header.L1Size) {
+		return fmt.Errorf("qcow2: write beyond L1 table bounds")
+	}
+
+	// Get or allocate L2 table
+	img.l1Mu.Lock()
+	l1Entry := binary.BigEndian.Uint64(img.l1Table[l1Index*8:])
+	l2TableOff := l1Entry & L1EntryOffsetMask
+
+	if l2TableOff == 0 {
+		// Need to allocate L2 table
+		var err error
+		l2TableOff, err = img.allocateCluster()
+		if err != nil {
+			img.l1Mu.Unlock()
+			return err
+		}
+
+		// Zero the new L2 table
+		zeros := make([]byte, img.clusterSize)
+		if _, err := img.file.WriteAt(zeros, int64(l2TableOff)); err != nil {
+			img.l1Mu.Unlock()
+			return err
+		}
+
+		// Barrier: ensure L2 table is on disk before L1 points to it
+		if err := img.metadataBarrier(); err != nil {
+			img.l1Mu.Unlock()
+			return fmt.Errorf("qcow2: L2 table barrier failed: %w", err)
+		}
+
+		// Update L1 entry with COPIED flag set
+		newL1Entry := l2TableOff | L1EntryCopied
+		binary.BigEndian.PutUint64(img.l1Table[l1Index*8:], newL1Entry)
+
+		// Write L1 entry to disk
+		if _, err := img.file.WriteAt(img.l1Table[l1Index*8:l1Index*8+8],
+			int64(img.header.L1TableOffset+l1Index*8)); err != nil {
+			img.l1Mu.Unlock()
+			return err
+		}
+
+		// Barrier: ensure L1 update is on disk
+		if err := img.metadataBarrier(); err != nil {
+			img.l1Mu.Unlock()
+			return fmt.Errorf("qcow2: L1 update barrier failed: %w", err)
+		}
+	}
+	img.l1Mu.Unlock()
+
+	// Get L2 table
+	l2Table, err := img.getL2Table(l2TableOff)
+	if err != nil {
+		return err
+	}
+
+	// Check current L2 entry
+	l2Entry := binary.BigEndian.Uint64(l2Table[l2Index*8:])
+
+	// If already zero (ZERO_PLAIN), nothing to do
+	if l2Entry&L2EntryZeroFlag != 0 && l2Entry&L2EntryOffsetMask == 0 {
+		return nil
+	}
+
+	// If cluster was allocated, decrement refcount (deallocation)
+	oldOffset := l2Entry & L2EntryOffsetMask
+	if oldOffset != 0 {
+		if err := img.decrementRefcount(oldOffset); err != nil {
+			return fmt.Errorf("qcow2: failed to decrement refcount for deallocated cluster: %w", err)
+		}
+	}
+
+	// Set zero flag, clear offset (ZERO_PLAIN mode)
+	newL2Entry := L2EntryZeroFlag
+	binary.BigEndian.PutUint64(l2Table[l2Index*8:], newL2Entry)
+
+	// Write L2 entry to disk
+	if _, err := img.file.WriteAt(l2Table[l2Index*8:l2Index*8+8],
+		int64(l2TableOff+l2Index*8)); err != nil {
+		return err
+	}
+
+	// Barrier: ensure L2 update is on disk
+	if err := img.metadataBarrier(); err != nil {
+		return fmt.Errorf("qcow2: L2 zero update barrier failed: %w", err)
+	}
+
+	// Update cache
+	img.l2Cache.put(l2TableOff, l2Table)
+
+	return nil
 }

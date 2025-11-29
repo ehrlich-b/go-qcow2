@@ -6,6 +6,21 @@ import (
 	"path/filepath"
 )
 
+// RawImage wraps an *os.File to implement BackingStore for raw backing files.
+type RawImage struct {
+	file *os.File
+}
+
+// ReadAt implements io.ReaderAt for raw backing files.
+func (r *RawImage) ReadAt(p []byte, off int64) (int, error) {
+	return r.file.ReadAt(p, off)
+}
+
+// Close implements io.Closer for raw backing files.
+func (r *RawImage) Close() error {
+	return r.file.Close()
+}
+
 // openBackingFile opens the backing file if one is specified.
 func (img *Image) openBackingFile() error {
 	if img.header.BackingFileOffset == 0 || img.header.BackingFileSize == 0 {
@@ -28,13 +43,34 @@ func (img *Image) openBackingFile() error {
 		backingPath = filepath.Join(imgDir, backingPath)
 	}
 
-	// Open backing file (read-only)
-	backing, err := OpenFile(backingPath, os.O_RDONLY, 0)
-	if err != nil {
-		return fmt.Errorf("qcow2: failed to open backing file %q: %w", backingPath, err)
+	// Check backing format from header extension
+	backingFormat := ""
+	if img.extensions != nil {
+		backingFormat = img.extensions.BackingFormat
 	}
 
-	img.backing = backing
+	// Open backing file based on format
+	switch backingFormat {
+	case "raw":
+		// Open as raw image
+		f, err := os.OpenFile(backingPath, os.O_RDONLY, 0)
+		if err != nil {
+			return fmt.Errorf("qcow2: failed to open raw backing file %q: %w", backingPath, err)
+		}
+		img.backing = &RawImage{file: f}
+
+	case "qcow2", "":
+		// Open as qcow2 (default if format not specified)
+		backing, err := OpenFile(backingPath, os.O_RDONLY, 0)
+		if err != nil {
+			return fmt.Errorf("qcow2: failed to open backing file %q: %w", backingPath, err)
+		}
+		img.backing = backing
+
+	default:
+		return fmt.Errorf("qcow2: unsupported backing file format %q", backingFormat)
+	}
+
 	return nil
 }
 
@@ -65,7 +101,13 @@ func (img *Image) BackingChainDepth() int {
 	current := img.backing
 	for current != nil {
 		depth++
-		current = current.backing
+		// Only qcow2 images can have further backing files
+		if qcow2Img, ok := current.(*Image); ok {
+			current = qcow2Img.backing
+		} else {
+			// Raw images don't have backing files
+			break
+		}
 	}
 	return depth
 }
