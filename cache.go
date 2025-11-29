@@ -32,6 +32,11 @@ func newL2Cache(maxSize, _ int) *l2Cache {
 
 // get retrieves an L2 table from the cache.
 // Returns nil if not found.
+//
+// IMPORTANT: The returned slice is a direct reference to cached data.
+// Callers may read from it freely. Callers that modify the slice MUST
+// call put() afterwards to ensure cache consistency. Concurrent access
+// to different 8-byte entries within the same L2 table is safe.
 func (c *l2Cache) get(offset uint64) []byte {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -44,10 +49,9 @@ func (c *l2Cache) get(offset uint64) []byte {
 	// Move to front (most recently used)
 	c.moveToFront(entry)
 
-	// Return a copy to avoid races
-	result := make([]byte, len(entry.data))
-	copy(result, entry.data)
-	return result
+	// Return direct reference - no copy needed.
+	// Callers reading don't modify, callers writing call put() after.
+	return entry.data
 }
 
 // put adds or updates an L2 table in the cache.

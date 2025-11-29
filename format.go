@@ -82,6 +82,22 @@ const (
 	BarrierFull
 )
 
+// ZeroMode controls how zero clusters are written.
+type ZeroMode int
+
+const (
+	// ZeroPlain deallocates the cluster and sets the zero flag.
+	// The cluster offset is cleared and refcount decremented.
+	// This is the most space-efficient mode.
+	ZeroPlain ZeroMode = iota
+
+	// ZeroAlloc keeps the cluster allocated but sets the zero flag.
+	// The cluster offset is preserved and refcount unchanged.
+	// Reads still return zeros, but the space remains reserved.
+	// Useful for preallocated images or security (avoid cluster reuse).
+	ZeroAlloc
+)
+
 // L2 entry flags (in the high bits of the 64-bit entry)
 const (
 	L2EntryCompressed = uint64(1) << 62

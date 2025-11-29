@@ -63,6 +63,9 @@ type Image struct {
 	// Header extensions
 	extensions *HeaderExtensions
 
+	// Snapshots
+	snapshots []*Snapshot
+
 	// Write ordering barrier mode
 	barrierMode WriteBarrierMode
 
@@ -226,6 +229,11 @@ func newImage(f *os.File, readOnly bool, chainDepth int) (*Image, error) {
 		return nil, fmt.Errorf("qcow2: failed to parse header extensions: %w", err)
 	}
 	img.extensions = extensions
+
+	// Load snapshots if present
+	if err := img.loadSnapshots(); err != nil {
+		return nil, fmt.Errorf("qcow2: failed to load snapshots: %w", err)
+	}
 
 	// Open backing file if present
 	if err := img.openBackingFile(); err != nil {
@@ -968,7 +976,15 @@ func (img *Image) IsDirty() bool {
 // WriteZeroAt writes zeros efficiently using the zero cluster flag.
 // This avoids allocating storage for all-zero data.
 // It writes zeros from offset off for length bytes.
+// Uses ZeroPlain mode which deallocates clusters.
 func (img *Image) WriteZeroAt(off int64, length int64) error {
+	return img.WriteZeroAtMode(off, length, ZeroPlain)
+}
+
+// WriteZeroAtMode writes zeros with the specified zero mode.
+// ZeroPlain deallocates clusters for space efficiency.
+// ZeroAlloc keeps clusters allocated (useful for preallocated images).
+func (img *Image) WriteZeroAtMode(off int64, length int64, mode ZeroMode) error {
 	if img.readOnly {
 		return ErrReadOnly
 	}
@@ -1010,7 +1026,7 @@ func (img *Image) WriteZeroAt(off int64, length int64) error {
 
 		// Full cluster - use zero flag
 		if uint64(length) >= img.clusterSize {
-			if err := img.setZeroCluster(clusterStart); err != nil {
+			if err := img.setZeroCluster(clusterStart, mode); err != nil {
 				return err
 			}
 			off += int64(img.clusterSize)
@@ -1030,9 +1046,10 @@ func (img *Image) WriteZeroAt(off int64, length int64) error {
 	return nil
 }
 
-// setZeroCluster marks a cluster as zero without allocating storage.
-// This is the ZERO_PLAIN mode - the cluster offset is cleared.
-func (img *Image) setZeroCluster(virtOff uint64) error {
+// setZeroCluster marks a cluster as zero using the specified mode.
+// ZeroPlain: clears the offset and decrements refcount (space efficient).
+// ZeroAlloc: keeps the offset and refcount (preserves allocation).
+func (img *Image) setZeroCluster(virtOff uint64, mode ZeroMode) error {
 	// Calculate L1 and L2 indices
 	l2Index := (virtOff >> img.clusterBits) & (img.l2Entries - 1)
 	l1Index := virtOff >> (img.clusterBits + img.l2Bits)
@@ -1051,22 +1068,43 @@ func (img *Image) setZeroCluster(virtOff uint64) error {
 
 	// Check current L2 entry
 	l2Entry := binary.BigEndian.Uint64(l2Table[l2Index*8:])
-
-	// If already zero (ZERO_PLAIN), nothing to do
-	if l2Entry&L2EntryZeroFlag != 0 && l2Entry&L2EntryOffsetMask == 0 {
-		return nil
-	}
-
-	// If cluster was allocated, decrement refcount (deallocation)
 	oldOffset := l2Entry & L2EntryOffsetMask
-	if oldOffset != 0 {
-		if err := img.decrementRefcount(oldOffset); err != nil {
-			return fmt.Errorf("qcow2: failed to decrement refcount for deallocated cluster: %w", err)
+
+	// Check if already in desired state
+	if l2Entry&L2EntryZeroFlag != 0 {
+		if mode == ZeroPlain && oldOffset == 0 {
+			// Already ZERO_PLAIN
+			return nil
+		}
+		if mode == ZeroAlloc && oldOffset != 0 {
+			// Already ZERO_ALLOC
+			return nil
 		}
 	}
 
-	// Set zero flag, clear offset (ZERO_PLAIN mode)
-	newL2Entry := L2EntryZeroFlag
+	var newL2Entry uint64
+	if mode == ZeroAlloc {
+		// ZERO_ALLOC: keep the offset, just add zero flag
+		if oldOffset == 0 {
+			// Can't use ZeroAlloc on unallocated cluster - allocate first
+			var allocErr error
+			oldOffset, allocErr = img.allocateCluster()
+			if allocErr != nil {
+				return allocErr
+			}
+		}
+		// Preserve offset and COPIED flag, add zero flag
+		newL2Entry = (oldOffset | L2EntryCopied | L2EntryZeroFlag)
+	} else {
+		// ZERO_PLAIN: clear offset, decrement refcount if was allocated
+		if oldOffset != 0 {
+			if err := img.decrementRefcount(oldOffset); err != nil {
+				return fmt.Errorf("qcow2: failed to decrement refcount for deallocated cluster: %w", err)
+			}
+		}
+		newL2Entry = L2EntryZeroFlag
+	}
+
 	binary.BigEndian.PutUint64(l2Table[l2Index*8:], newL2Entry)
 
 	// Write L2 entry to disk

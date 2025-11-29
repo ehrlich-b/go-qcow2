@@ -12,6 +12,7 @@ import (
 )
 
 func TestCreateAndOpen(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.qcow2")
 
@@ -46,6 +47,7 @@ func TestCreateAndOpen(t *testing.T) {
 }
 
 func TestReadWriteRoundtrip(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.qcow2")
 
@@ -98,6 +100,7 @@ func TestReadWriteRoundtrip(t *testing.T) {
 }
 
 func TestReadUnallocated(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.qcow2")
 
@@ -132,6 +135,7 @@ func TestReadUnallocated(t *testing.T) {
 }
 
 func TestWriteAtOffset(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.qcow2")
 
@@ -165,6 +169,7 @@ func TestWriteAtOffset(t *testing.T) {
 }
 
 func TestCrossClusterWrite(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.qcow2")
 
@@ -204,6 +209,7 @@ func TestCrossClusterWrite(t *testing.T) {
 }
 
 func TestReadBeyondEOF(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.qcow2")
 
@@ -229,6 +235,7 @@ func TestReadBeyondEOF(t *testing.T) {
 }
 
 func TestHeaderParsing(t *testing.T) {
+	t.Parallel()
 	// Test with a manually constructed v3 header
 	header := make([]byte, HeaderSizeV3)
 
@@ -299,6 +306,7 @@ func TestHeaderParsing(t *testing.T) {
 }
 
 func TestInvalidMagic(t *testing.T) {
+	t.Parallel()
 	header := make([]byte, HeaderSizeV2)
 	header[0] = 0x00 // Wrong magic
 
@@ -309,6 +317,7 @@ func TestInvalidMagic(t *testing.T) {
 }
 
 func TestL2Cache(t *testing.T) {
+	t.Parallel()
 	cache := newL2Cache(3, 64) // Small cache for testing
 
 	// Add entries
@@ -366,6 +375,7 @@ func TestL2Cache(t *testing.T) {
 }
 
 func TestDirtyBitTracking(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.qcow2")
 
@@ -415,6 +425,7 @@ func TestDirtyBitTracking(t *testing.T) {
 }
 
 func TestBackingFile(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	basePath := filepath.Join(dir, "base.qcow2")
 	overlayPath := filepath.Join(dir, "overlay.qcow2")
@@ -504,6 +515,7 @@ func TestBackingFile(t *testing.T) {
 }
 
 func TestRefcountReading(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.qcow2")
 
@@ -546,6 +558,7 @@ func TestRefcountReading(t *testing.T) {
 }
 
 func TestReadOnly(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.qcow2")
 
@@ -571,6 +584,7 @@ func TestReadOnly(t *testing.T) {
 }
 
 func TestRefcountUpdates(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.qcow2")
 
@@ -632,6 +646,7 @@ func TestRefcountUpdates(t *testing.T) {
 }
 
 func TestRefcountEntryReadWrite(t *testing.T) {
+	t.Parallel()
 	// Test readRefcountEntry and writeRefcountEntry for various bit widths
 	tests := []struct {
 		bits  uint32
@@ -681,6 +696,7 @@ func TestRefcountEntryReadWrite(t *testing.T) {
 }
 
 func TestHeaderExtensions(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.qcow2")
 
@@ -705,6 +721,7 @@ func TestHeaderExtensions(t *testing.T) {
 }
 
 func TestHeaderExtensionsParsing(t *testing.T) {
+	t.Parallel()
 	// Test feature name table parsing
 	names := make(map[string]string)
 
@@ -726,6 +743,7 @@ func TestHeaderExtensionsParsing(t *testing.T) {
 }
 
 func TestWriteZeroAt(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.qcow2")
 
@@ -803,6 +821,7 @@ func TestWriteZeroAt(t *testing.T) {
 }
 
 func TestWriteZeroAtPartialCluster(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.qcow2")
 
@@ -854,7 +873,117 @@ func TestWriteZeroAtPartialCluster(t *testing.T) {
 	img.Close()
 }
 
+func TestWriteZeroAtModeAlloc(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.qcow2")
+
+	// Create image with 2 clusters
+	img, err := CreateSimple(path, 128*1024)
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+
+	// Write data to first cluster
+	data := make([]byte, 64*1024)
+	for i := range data {
+		data[i] = byte(i % 256)
+	}
+	if _, err := img.WriteAt(data, 0); err != nil {
+		t.Fatalf("WriteAt failed: %v", err)
+	}
+
+	// Get file size after write
+	info1, _ := img.file.Stat()
+	sizeBefore := info1.Size()
+
+	// Zero using ZeroAlloc mode (should keep allocation)
+	if err := img.WriteZeroAtMode(0, 64*1024, ZeroAlloc); err != nil {
+		t.Fatalf("WriteZeroAtMode(ZeroAlloc) failed: %v", err)
+	}
+
+	// Verify reading back zeros
+	readBuf := make([]byte, 64*1024)
+	if _, err := img.ReadAt(readBuf, 0); err != nil {
+		t.Fatalf("ReadAt failed: %v", err)
+	}
+	for i, b := range readBuf {
+		if b != 0 {
+			t.Errorf("Expected zero at offset %d, got %d", i, b)
+			break
+		}
+	}
+
+	// File size should be unchanged (allocation preserved)
+	info2, _ := img.file.Stat()
+	sizeAfter := info2.Size()
+	if sizeAfter != sizeBefore {
+		t.Errorf("File size changed: before=%d, after=%d (ZeroAlloc should preserve)", sizeBefore, sizeAfter)
+	}
+
+	img.Close()
+
+	// Reopen and verify zeros persist
+	img, err = Open(path)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	if _, err := img.ReadAt(readBuf, 0); err != nil {
+		t.Fatalf("ReadAt failed: %v", err)
+	}
+	for i, b := range readBuf {
+		if b != 0 {
+			t.Errorf("After reopen: expected zero at offset %d, got %d", i, b)
+			break
+		}
+	}
+	img.Close()
+}
+
+func TestWriteZeroAtModeAllocOnUnallocated(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.qcow2")
+
+	// Create image
+	img, err := CreateSimple(path, 128*1024)
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+
+	// Get file size before (no data written yet)
+	info1, _ := img.file.Stat()
+	sizeBefore := info1.Size()
+
+	// Zero using ZeroAlloc mode on unallocated cluster (should allocate)
+	if err := img.WriteZeroAtMode(0, 64*1024, ZeroAlloc); err != nil {
+		t.Fatalf("WriteZeroAtMode(ZeroAlloc) failed: %v", err)
+	}
+
+	// File size should have grown (new cluster allocated)
+	info2, _ := img.file.Stat()
+	sizeAfter := info2.Size()
+	if sizeAfter <= sizeBefore {
+		t.Errorf("File size didn't grow: before=%d, after=%d (ZeroAlloc on unallocated should allocate)", sizeBefore, sizeAfter)
+	}
+
+	// Verify reading back zeros
+	readBuf := make([]byte, 64*1024)
+	if _, err := img.ReadAt(readBuf, 0); err != nil {
+		t.Fatalf("ReadAt failed: %v", err)
+	}
+	for i, b := range readBuf {
+		if b != 0 {
+			t.Errorf("Expected zero at offset %d, got %d", i, b)
+			break
+		}
+	}
+
+	img.Close()
+}
+
 func TestFreeClusterReuse(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.qcow2")
 
@@ -942,6 +1071,7 @@ func TestFreeClusterReuse(t *testing.T) {
 }
 
 func TestRefcountDeallocation(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.qcow2")
 
@@ -1012,6 +1142,7 @@ func TestRefcountDeallocation(t *testing.T) {
 }
 
 func TestRawBackingFile(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	rawPath := filepath.Join(dir, "base.raw")
 	overlayPath := filepath.Join(dir, "overlay.qcow2")
@@ -1109,6 +1240,7 @@ func TestRawBackingFile(t *testing.T) {
 }
 
 func TestOverlapChecks(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.qcow2")
 
@@ -1193,6 +1325,7 @@ func TestOverlapChecks(t *testing.T) {
 }
 
 func TestLazyRefcounts(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.qcow2")
 
@@ -1285,6 +1418,7 @@ func TestLazyRefcounts(t *testing.T) {
 }
 
 func TestLazyRefcountsDeferral(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.qcow2")
 
@@ -1342,6 +1476,7 @@ func TestLazyRefcountsDeferral(t *testing.T) {
 }
 
 func TestCheck(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.qcow2")
 
@@ -1388,6 +1523,7 @@ func TestCheck(t *testing.T) {
 }
 
 func TestCheckAfterWriteZero(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.qcow2")
 
@@ -1428,6 +1564,7 @@ func TestCheckAfterWriteZero(t *testing.T) {
 }
 
 func TestRepair(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.qcow2")
 
@@ -1482,6 +1619,7 @@ func TestRepair(t *testing.T) {
 }
 
 func TestCheckReadOnly(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.qcow2")
 
@@ -1516,6 +1654,7 @@ func TestCheckReadOnly(t *testing.T) {
 }
 
 func TestWriteBarrierModes(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.qcow2")
 
@@ -1562,6 +1701,7 @@ func TestWriteBarrierModes(t *testing.T) {
 }
 
 func TestWriteBarrierModeNone(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.qcow2")
 
@@ -1609,6 +1749,7 @@ func TestWriteBarrierModeNone(t *testing.T) {
 }
 
 func TestWriteBarrierWithZeroCluster(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.qcow2")
 
@@ -1661,6 +1802,7 @@ func TestWriteBarrierWithZeroCluster(t *testing.T) {
 }
 
 func TestBackingChainDepthLimit(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 
 	// Create a chain that exceeds MaxBackingChainDepth

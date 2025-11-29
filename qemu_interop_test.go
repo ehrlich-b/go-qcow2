@@ -23,6 +23,7 @@ import (
 // TestQemuInterop_CreateWithUs_VerifyWithQemu creates an image with go-qcow2
 // and verifies it passes qemu-img check.
 func TestQemuInterop_CreateWithUs_VerifyWithQemu(t *testing.T) {
+	t.Parallel()
 	testutil.RequireQemu(t)
 
 	tests := []struct {
@@ -39,6 +40,7 @@ func TestQemuInterop_CreateWithUs_VerifyWithQemu(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			path := testutil.TempImage(t, "test.qcow2")
 
 			// Create with go-qcow2
@@ -76,6 +78,7 @@ func TestQemuInterop_CreateWithUs_VerifyWithQemu(t *testing.T) {
 // TestQemuInterop_CreateWithQemu_OpenWithUs creates an image with qemu-img
 // and verifies go-qcow2 can open and read it correctly.
 func TestQemuInterop_CreateWithQemu_OpenWithUs(t *testing.T) {
+	t.Parallel()
 	testutil.RequireQemu(t)
 
 	tests := []struct {
@@ -92,6 +95,7 @@ func TestQemuInterop_CreateWithQemu_OpenWithUs(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			path := testutil.TempImage(t, "qemu.qcow2")
 
 			// Create with qemu-img
@@ -132,6 +136,7 @@ func TestQemuInterop_CreateWithQemu_OpenWithUs(t *testing.T) {
 // TestQemuInterop_WriteWithUs_ReadWithQemu writes data with go-qcow2
 // and verifies qemu-io can read it correctly.
 func TestQemuInterop_WriteWithUs_ReadWithQemu(t *testing.T) {
+	t.Parallel()
 	testutil.RequireQemu(t)
 	testutil.RequireQemuIO(t)
 
@@ -200,6 +205,7 @@ func TestQemuInterop_WriteWithUs_ReadWithQemu(t *testing.T) {
 // TestQemuInterop_WriteWithQemu_ReadWithUs writes data with qemu-io
 // and verifies go-qcow2 can read it correctly.
 func TestQemuInterop_WriteWithQemu_ReadWithUs(t *testing.T) {
+	t.Parallel()
 	testutil.RequireQemu(t)
 	testutil.RequireQemuIO(t)
 
@@ -250,6 +256,7 @@ func TestQemuInterop_WriteWithQemu_ReadWithUs(t *testing.T) {
 // TestQemuInterop_FullRoundtrip tests reading and writing alternating
 // between go-qcow2 and QEMU.
 func TestQemuInterop_FullRoundtrip(t *testing.T) {
+	t.Parallel()
 	testutil.RequireQemu(t)
 	testutil.RequireQemuIO(t)
 
@@ -328,6 +335,7 @@ func TestQemuInterop_FullRoundtrip(t *testing.T) {
 
 // TestQemuInterop_BackingFile tests backing file chain compatibility.
 func TestQemuInterop_BackingFile(t *testing.T) {
+	t.Parallel()
 	testutil.RequireQemu(t)
 	testutil.RequireQemuIO(t)
 
@@ -389,6 +397,7 @@ func TestQemuInterop_BackingFile(t *testing.T) {
 
 // TestQemuInterop_Compression tests reading compressed clusters.
 func TestQemuInterop_Compression(t *testing.T) {
+	t.Parallel()
 	testutil.RequireQemu(t)
 
 	dir := t.TempDir()
@@ -432,6 +441,7 @@ func TestQemuInterop_Compression(t *testing.T) {
 
 // TestQemuInterop_ZeroClusters tests zero cluster handling.
 func TestQemuInterop_ZeroClusters(t *testing.T) {
+	t.Parallel()
 	testutil.RequireQemu(t)
 
 	path := testutil.TempImage(t, "zeros.qcow2")
@@ -464,6 +474,7 @@ func TestQemuInterop_ZeroClusters(t *testing.T) {
 
 // TestQemuInterop_LazyRefcountsRecovery tests lazy refcount recovery.
 func TestQemuInterop_LazyRefcountsRecovery(t *testing.T) {
+	t.Parallel()
 	testutil.RequireQemu(t)
 
 	path := testutil.TempImage(t, "lazy.qcow2")
@@ -510,6 +521,7 @@ func TestQemuInterop_LazyRefcountsRecovery(t *testing.T) {
 
 // TestQemuInterop_ClusterSizes tests various cluster sizes.
 func TestQemuInterop_ClusterSizes(t *testing.T) {
+	t.Parallel()
 	testutil.RequireQemu(t)
 
 	// Test a range of cluster sizes
@@ -518,6 +530,7 @@ func TestQemuInterop_ClusterSizes(t *testing.T) {
 	for _, bits := range clusterBits {
 		clusterSize := 1 << bits
 		t.Run(byteSizeStr(int64(clusterSize)), func(t *testing.T) {
+			t.Parallel()
 			path := testutil.TempImage(t, "cluster.qcow2")
 
 			// Create with go-qcow2
@@ -582,6 +595,7 @@ func itoa(n int64) string {
 
 // TestQemuInterop_Version tests against different QEMU output formats.
 func TestQemuInterop_Version(t *testing.T) {
+	t.Parallel()
 	testutil.RequireQemu(t)
 
 	version := testutil.QemuVersion(t)
@@ -611,6 +625,7 @@ func TestQemuInterop_Version(t *testing.T) {
 
 // TestQemuInterop_RawBacking tests raw backing file support.
 func TestQemuInterop_RawBacking(t *testing.T) {
+	t.Parallel()
 	testutil.RequireQemu(t)
 	testutil.RequireQemuIO(t)
 
@@ -657,5 +672,153 @@ func TestQemuInterop_RawBacking(t *testing.T) {
 	// Verify qemu-io can read raw data through overlay
 	if !testutil.QemuRead(t, overlayPath, rawData[0], 0, 1) {
 		t.Log("Note: qemu-io pattern verify may differ for random data")
+	}
+}
+
+// TestQemuInterop_Snapshots tests snapshot parsing.
+func TestQemuInterop_Snapshots(t *testing.T) {
+	t.Parallel()
+	testutil.RequireQemu(t)
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.qcow2")
+
+	// Create image with QEMU
+	testutil.QemuCreate(t, path, "10M")
+
+	// Write some data
+	testutil.QemuWrite(t, path, 0xAA, 0, 4096)
+
+	// Create first snapshot
+	testutil.QemuSnapshot(t, path, "snap1")
+
+	// Write different data
+	testutil.QemuWrite(t, path, 0xBB, 0, 4096)
+
+	// Create second snapshot
+	testutil.QemuSnapshot(t, path, "snap2")
+
+	// Verify QEMU sees the snapshots
+	qemuSnaps := testutil.QemuListSnapshots(t, path)
+	if len(qemuSnaps) != 2 {
+		t.Fatalf("QEMU reports %d snapshots, want 2", len(qemuSnaps))
+	}
+
+	// Open with go-qcow2 and verify we parse the snapshots
+	img, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer img.Close()
+
+	snaps := img.Snapshots()
+	if len(snaps) != 2 {
+		t.Fatalf("Parsed %d snapshots, want 2", len(snaps))
+	}
+
+	// Verify snapshot names
+	if snaps[0].Name != "snap1" {
+		t.Errorf("Snapshot 0 name = %q, want %q", snaps[0].Name, "snap1")
+	}
+	if snaps[1].Name != "snap2" {
+		t.Errorf("Snapshot 1 name = %q, want %q", snaps[1].Name, "snap2")
+	}
+
+	// Verify L1 table offsets are set
+	if snaps[0].L1TableOffset == 0 {
+		t.Error("Snapshot 0 L1TableOffset is 0")
+	}
+	if snaps[1].L1TableOffset == 0 {
+		t.Error("Snapshot 1 L1TableOffset is 0")
+	}
+
+	// Verify FindSnapshot works
+	found := img.FindSnapshot("snap1")
+	if found == nil {
+		t.Error("FindSnapshot(snap1) returned nil")
+	} else if found.Name != "snap1" {
+		t.Errorf("FindSnapshot(snap1).Name = %q, want %q", found.Name, "snap1")
+	}
+
+	// Verify FindSnapshot with non-existent name
+	notFound := img.FindSnapshot("nonexistent")
+	if notFound != nil {
+		t.Error("FindSnapshot(nonexistent) should return nil")
+	}
+}
+
+// TestQemuInterop_ReadAtSnapshot tests reading data from a specific snapshot.
+func TestQemuInterop_ReadAtSnapshot(t *testing.T) {
+	t.Parallel()
+	testutil.RequireQemu(t)
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.qcow2")
+
+	// Create image with QEMU
+	testutil.QemuCreate(t, path, "10M")
+
+	// Write pattern 0xAA to first cluster
+	testutil.QemuWrite(t, path, 0xAA, 0, 4096)
+
+	// Create first snapshot
+	testutil.QemuSnapshot(t, path, "snap1")
+
+	// Write different pattern 0xBB to first cluster
+	testutil.QemuWrite(t, path, 0xBB, 0, 4096)
+
+	// Create second snapshot
+	testutil.QemuSnapshot(t, path, "snap2")
+
+	// Write pattern 0xCC to first cluster (current state)
+	testutil.QemuWrite(t, path, 0xCC, 0, 4096)
+
+	// Open with go-qcow2
+	img, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer img.Close()
+
+	// Read current state - should be 0xCC
+	buf := make([]byte, 4096)
+	if _, err := img.ReadAt(buf, 0); err != nil {
+		t.Fatalf("ReadAt failed: %v", err)
+	}
+	for i, b := range buf {
+		if b != 0xCC {
+			t.Errorf("Current state: byte %d = 0x%02X, want 0xCC", i, b)
+			break
+		}
+	}
+
+	// Read from snap1 - should be 0xAA
+	snap1 := img.FindSnapshot("snap1")
+	if snap1 == nil {
+		t.Fatal("FindSnapshot(snap1) returned nil")
+	}
+	if _, err := img.ReadAtSnapshot(buf, 0, snap1); err != nil {
+		t.Fatalf("ReadAtSnapshot(snap1) failed: %v", err)
+	}
+	for i, b := range buf {
+		if b != 0xAA {
+			t.Errorf("Snapshot snap1: byte %d = 0x%02X, want 0xAA", i, b)
+			break
+		}
+	}
+
+	// Read from snap2 - should be 0xBB
+	snap2 := img.FindSnapshot("snap2")
+	if snap2 == nil {
+		t.Fatal("FindSnapshot(snap2) returned nil")
+	}
+	if _, err := img.ReadAtSnapshot(buf, 0, snap2); err != nil {
+		t.Fatalf("ReadAtSnapshot(snap2) failed: %v", err)
+	}
+	for i, b := range buf {
+		if b != 0xBB {
+			t.Errorf("Snapshot snap2: byte %d = 0x%02X, want 0xBB", i, b)
+			break
+		}
 	}
 }

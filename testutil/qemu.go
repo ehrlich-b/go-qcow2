@@ -369,3 +369,29 @@ func FileSize(t *testing.T, path string) int64 {
 	}
 	return info.Size()
 }
+
+// QemuSnapshot creates a snapshot in the image.
+func QemuSnapshot(t *testing.T, path string, name string) {
+	t.Helper()
+	result := RunQemuImg(t, "snapshot", "-c", name, path)
+	if !result.IsSuccess() {
+		t.Fatalf("qemu-img snapshot -c failed: %s", result.Stderr)
+	}
+}
+
+// QemuListSnapshots lists snapshots in JSON format.
+func QemuListSnapshots(t *testing.T, path string) []map[string]interface{} {
+	t.Helper()
+	result := RunQemuImg(t, "info", "--output=json", path)
+	if !result.IsSuccess() {
+		t.Fatalf("qemu-img info failed: %s", result.Stderr)
+	}
+
+	var info struct {
+		Snapshots []map[string]interface{} `json:"snapshots"`
+	}
+	if err := json.Unmarshal([]byte(result.Stdout), &info); err != nil {
+		t.Fatalf("Failed to parse qemu-img info output: %v", err)
+	}
+	return info.Snapshots
+}
