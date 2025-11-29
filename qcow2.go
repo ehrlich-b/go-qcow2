@@ -51,8 +51,9 @@ type Image struct {
 	// Lazy refcounts mode - defer refcount updates for better write performance
 	lazyRefcounts bool
 
-	// Free cluster tracking - hint for next free cluster search
-	freeClusterHint uint64
+	// Free cluster tracking - bitmap for O(1) allocation
+	freeBitmap     *freeClusterBitmap
+	freeBitmapOnce sync.Once
 
 	// Backing file for COW chains
 	backing BackingStore
@@ -68,6 +69,9 @@ type Image struct {
 
 	// Write ordering barrier mode
 	barrierMode WriteBarrierMode
+
+	// Pending sync flag for batched barrier mode
+	pendingSync bool
 
 	// Buffer pool for cluster-sized allocations
 	clusterPool sync.Pool
@@ -95,15 +99,28 @@ func (img *Image) getZeroedClusterBuffer() []byte {
 
 // metadataBarrier issues a sync if barrier mode requires it for metadata updates.
 func (img *Image) metadataBarrier() error {
-	if img.barrierMode >= BarrierMetadata {
+	switch img.barrierMode {
+	case BarrierNone:
+		return nil
+	case BarrierBatched:
+		img.pendingSync = true
+		return nil
+	default: // BarrierMetadata, BarrierFull
 		return img.file.Sync()
 	}
-	return nil
 }
 
 // dataBarrier issues a sync if barrier mode requires it for data writes.
 func (img *Image) dataBarrier() error {
-	if img.barrierMode >= BarrierFull {
+	switch img.barrierMode {
+	case BarrierNone:
+		return nil
+	case BarrierBatched:
+		img.pendingSync = true
+		return nil
+	case BarrierMetadata:
+		return nil
+	case BarrierFull:
 		return img.file.Sync()
 	}
 	return nil
@@ -812,6 +829,12 @@ func (img *Image) allocateCluster() (uint64, error) {
 		return 0, err
 	}
 
+	// Grow bitmap if it exists to track the new cluster
+	if img.freeBitmap != nil {
+		newNumClusters := (offset + img.clusterSize) >> img.clusterBits
+		img.freeBitmap.grow(newNumClusters)
+	}
+
 	// Update refcount for the new cluster
 	if err := img.incrementRefcount(offset); err != nil {
 		return 0, fmt.Errorf("qcow2: failed to update refcount for new cluster: %w", err)
@@ -820,52 +843,30 @@ func (img *Image) allocateCluster() (uint64, error) {
 	return offset, nil
 }
 
-// findFreeCluster searches for a cluster with refcount == 0.
-// It starts from freeClusterHint and scans forward.
-// Returns the cluster offset and true if found, or 0 and false if none available.
-func (img *Image) findFreeCluster() (uint64, bool) {
+// buildFreeBitmap scans refcounts and builds the free cluster bitmap.
+// Called once lazily on first free cluster search.
+func (img *Image) buildFreeBitmap() {
 	if err := img.loadRefcountTable(); err != nil {
-		return 0, false
+		return
 	}
 
-	// Calculate minimum cluster index (skip header and metadata)
-	// Start after the first few clusters which contain header, L1, refcount table
-	minCluster := uint64(4) // Skip first 4 clusters as they likely contain metadata
-
-	// Use hint as starting point, or start from minCluster
-	startCluster := img.freeClusterHint
-	if startCluster < minCluster {
-		startCluster = minCluster
-	}
-
-	// Calculate maximum cluster index based on file size
+	// Calculate file size to determine number of clusters
 	info, err := img.file.Stat()
 	if err != nil {
-		return 0, false
+		return
 	}
-	maxCluster := uint64(info.Size()) >> img.clusterBits
-	if maxCluster == 0 {
-		return 0, false
-	}
-
-	// Search from startCluster to maxCluster
-	for clusterIdx := startCluster; clusterIdx < maxCluster; clusterIdx++ {
-		refcount, err := img.getRefcount(clusterIdx << img.clusterBits)
-		if err != nil {
-			continue
-		}
-		if refcount == 0 {
-			// Verify this isn't overlapping with metadata
-			clusterOff := clusterIdx << img.clusterBits
-			if !img.isMetadataCluster(clusterOff) {
-				img.freeClusterHint = clusterIdx + 1
-				return clusterOff, true
-			}
-		}
+	numClusters := uint64(info.Size()) >> img.clusterBits
+	if numClusters == 0 {
+		return
 	}
 
-	// Wrap around: search from minCluster to startCluster
-	for clusterIdx := minCluster; clusterIdx < startCluster && clusterIdx < maxCluster; clusterIdx++ {
+	// Skip first 4 clusters (header and initial metadata)
+	minCluster := uint64(4)
+
+	img.freeBitmap = newFreeClusterBitmap(numClusters, minCluster)
+
+	// Scan refcounts and mark free clusters
+	for clusterIdx := minCluster; clusterIdx < numClusters; clusterIdx++ {
 		refcount, err := img.getRefcount(clusterIdx << img.clusterBits)
 		if err != nil {
 			continue
@@ -873,13 +874,38 @@ func (img *Image) findFreeCluster() (uint64, bool) {
 		if refcount == 0 {
 			clusterOff := clusterIdx << img.clusterBits
 			if !img.isMetadataCluster(clusterOff) {
-				img.freeClusterHint = clusterIdx + 1
-				return clusterOff, true
+				img.freeBitmap.setFree(clusterIdx)
 			}
 		}
 	}
+}
 
-	return 0, false
+// findFreeCluster searches for a cluster with refcount == 0 using O(1) bitmap lookup.
+// Returns the cluster offset and true if found, or 0 and false if none available.
+func (img *Image) findFreeCluster() (uint64, bool) {
+	// Build bitmap lazily on first use
+	img.freeBitmapOnce.Do(img.buildFreeBitmap)
+
+	if img.freeBitmap == nil {
+		return 0, false
+	}
+
+	// O(1) lookup using bitmap
+	clusterIdx, found := img.freeBitmap.findFree()
+	if !found {
+		return 0, false
+	}
+
+	clusterOff := clusterIdx << img.clusterBits
+
+	// Double-check this isn't metadata (bitmap should already exclude, but be safe)
+	if img.isMetadataCluster(clusterOff) {
+		// Mark as used in bitmap and try again
+		img.freeBitmap.setUsed(clusterIdx)
+		return img.findFreeCluster()
+	}
+
+	return clusterOff, true
 }
 
 // isMetadataCluster checks if a cluster offset contains QCOW2 metadata.
@@ -1036,11 +1062,12 @@ func (img *Image) CheckOverlap(hostOffset uint64) OverlapCheckResult {
 
 // Flush syncs all pending writes to disk.
 func (img *Image) Flush() error {
-	if img.dirty {
+	if img.dirty || img.pendingSync {
 		if err := img.file.Sync(); err != nil {
 			return err
 		}
 		img.dirty = false
+		img.pendingSync = false
 	}
 	return nil
 }

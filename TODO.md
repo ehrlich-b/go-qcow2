@@ -130,9 +130,9 @@
 - [x] Add refcount block cache - was disk I/O per refcount lookup
 - [x] sync.Pool for cluster buffers
 
-### P1 - High Impact
-- [ ] Batch fsync operations - currently 4 fsyncs per cluster allocation
-- [ ] Free cluster bitmap - O(1) allocation vs O(n) scan
+### P1 - High Impact ✅
+- [x] Batch fsync operations - BarrierBatched mode defers syncs until Flush()
+- [x] Free cluster bitmap - O(1) allocation using bitmap with lazy build
 
 ### P2 - Medium Priority
 - [ ] Lock sharding for L2 cache
@@ -185,7 +185,7 @@
 3. **Cluster allocation**: File-end growth with free cluster reuse via refcount scanning
 4. **BackingStore interface**: Supports both qcow2 and raw backing files
 5. **Lazy refcounts**: Skip refcount updates during writes, rebuild from L1/L2 on dirty open
-6. **Write ordering barriers**: Configurable via WriteBarrierMode (None/Metadata/Full)
+6. **Write ordering barriers**: Configurable via WriteBarrierMode (None/Batched/Metadata/Full)
 
 ### Open Questions
 1. Should we support mmap for large images?

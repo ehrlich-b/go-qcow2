@@ -405,8 +405,8 @@ func (img *Image) CreateSnapshot(name string) (*Snapshot, error) {
 	var extraData []byte
 	if img.header.Version >= Version3 {
 		extraData = make([]byte, 16)
-		binary.BigEndian.PutUint64(extraData[0:8], 0)                  // vm_state_size_large
-		binary.BigEndian.PutUint64(extraData[8:16], img.header.Size)   // disk_size
+		binary.BigEndian.PutUint64(extraData[0:8], 0)                // vm_state_size_large
+		binary.BigEndian.PutUint64(extraData[8:16], img.header.Size) // disk_size
 	}
 
 	// Create snapshot entry

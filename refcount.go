@@ -273,6 +273,19 @@ func (img *Image) updateRefcount(hostOffset uint64, delta int64) error {
 	// Update cache
 	img.refcountBlockCache.put(blockOffset, block)
 
+	// Update free bitmap if it exists
+	if img.freeBitmap != nil {
+		if currentRefcount == 0 && newRefcount > 0 {
+			// Cluster is now in use
+			img.freeBitmap.setUsed(clusterIndex)
+		} else if currentRefcount > 0 && newRefcount == 0 {
+			// Cluster is now free - only if not metadata
+			if !img.isMetadataCluster(hostOffset) {
+				img.freeBitmap.setFree(clusterIndex)
+			}
+		}
+	}
+
 	return nil
 }
 

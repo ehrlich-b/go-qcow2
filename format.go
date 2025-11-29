@@ -73,6 +73,12 @@ const (
 	// Use only for testing or when the underlying storage provides barriers.
 	BarrierNone WriteBarrierMode = iota
 
+	// BarrierBatched defers syncs until Flush() is called (fast, reasonably safe).
+	// Metadata updates are tracked but syncs are batched for performance.
+	// Call Flush() periodically or before Close() to ensure durability.
+	// This reduces the 4+ fsyncs per cluster allocation to 1 per Flush.
+	BarrierBatched
+
 	// BarrierMetadata syncs after metadata updates (L1/L2 table changes).
 	// This ensures metadata is consistent on disk but data writes may be lost.
 	BarrierMetadata

@@ -1677,6 +1677,11 @@ func TestWriteBarrierModes(t *testing.T) {
 		t.Errorf("After SetWriteBarrierMode(BarrierNone), got %d", img.WriteBarrierMode())
 	}
 
+	img.SetWriteBarrierMode(BarrierBatched)
+	if img.WriteBarrierMode() != BarrierBatched {
+		t.Errorf("After SetWriteBarrierMode(BarrierBatched), got %d", img.WriteBarrierMode())
+	}
+
 	img.SetWriteBarrierMode(BarrierFull)
 	if img.WriteBarrierMode() != BarrierFull {
 		t.Errorf("After SetWriteBarrierMode(BarrierFull), got %d", img.WriteBarrierMode())
@@ -1796,6 +1801,134 @@ func TestWriteBarrierWithZeroCluster(t *testing.T) {
 	for i, b := range buf {
 		if b != 0 {
 			t.Errorf("Byte %d after WriteZeroAt: got %d, want 0", i, b)
+			break
+		}
+	}
+}
+
+func TestWriteBarrierModeBatched(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.qcow2")
+
+	// Create image with BarrierBatched for performance
+	img, err := CreateSimple(path, 1024*1024)
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+	img.SetWriteBarrierMode(BarrierBatched)
+
+	if img.WriteBarrierMode() != BarrierBatched {
+		t.Errorf("Barrier mode = %d, want %d (BarrierBatched)",
+			img.WriteBarrierMode(), BarrierBatched)
+	}
+
+	// Write multiple clusters - syncs should be deferred
+	for i := 0; i < 10; i++ {
+		data := make([]byte, 4096)
+		for j := range data {
+			data[j] = byte(i)
+		}
+		_, err = img.WriteAt(data, int64(i*65536)) // Different clusters
+		if err != nil {
+			t.Fatalf("WriteAt cluster %d failed: %v", i, err)
+		}
+	}
+
+	// Explicit Flush should sync all pending writes
+	if err := img.Flush(); err != nil {
+		t.Fatalf("Flush failed: %v", err)
+	}
+
+	img.Close()
+
+	// Reopen and verify data
+	img2, err := Open(path)
+	if err != nil {
+		t.Fatalf("Reopen failed: %v", err)
+	}
+	defer img2.Close()
+
+	for i := 0; i < 10; i++ {
+		buf := make([]byte, 4096)
+		_, err = img2.ReadAt(buf, int64(i*65536))
+		if err != nil {
+			t.Fatalf("ReadAt cluster %d failed: %v", i, err)
+		}
+		for j, b := range buf {
+			if b != byte(i) {
+				t.Errorf("Cluster %d byte %d: got %d, want %d", i, j, b, i)
+				break
+			}
+		}
+	}
+}
+
+func TestWriteBarrierBatchedWithBackingFile(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+
+	// Create base image with pattern
+	basePath := filepath.Join(dir, "base.qcow2")
+	base, err := CreateSimple(basePath, 256*1024)
+	if err != nil {
+		t.Fatalf("Create base failed: %v", err)
+	}
+	baseData := make([]byte, 65536)
+	for i := range baseData {
+		baseData[i] = 0xBB
+	}
+	if _, err := base.WriteAt(baseData, 0); err != nil {
+		t.Fatalf("Write to base failed: %v", err)
+	}
+	base.Close()
+
+	// Create overlay with batched mode
+	overlayPath := filepath.Join(dir, "overlay.qcow2")
+	overlay, err := CreateOverlay(overlayPath, basePath)
+	if err != nil {
+		t.Fatalf("Create overlay failed: %v", err)
+	}
+	overlay.SetWriteBarrierMode(BarrierBatched)
+
+	// COW write (should copy from backing first)
+	cowData := []byte("COW data in batched mode")
+	if _, err := overlay.WriteAt(cowData, 100); err != nil {
+		t.Fatalf("COW write failed: %v", err)
+	}
+
+	// Flush batched syncs
+	if err := overlay.Flush(); err != nil {
+		t.Fatalf("Flush failed: %v", err)
+	}
+
+	overlay.Close()
+
+	// Verify overlay reads correctly
+	overlay2, err := Open(overlayPath)
+	if err != nil {
+		t.Fatalf("Reopen overlay failed: %v", err)
+	}
+	defer overlay2.Close()
+
+	// Check COW data
+	buf := make([]byte, len(cowData))
+	if _, err := overlay2.ReadAt(buf, 100); err != nil {
+		t.Fatalf("Read COW data failed: %v", err)
+	}
+	if !bytes.Equal(buf, cowData) {
+		t.Errorf("COW data mismatch: got %q, want %q", buf, cowData)
+	}
+
+	// Check backing data still readable (outside COW area but same cluster)
+	buf2 := make([]byte, 10)
+	if _, err := overlay2.ReadAt(buf2, 0); err != nil {
+		t.Fatalf("Read backing data failed: %v", err)
+	}
+	// After COW, the cluster should contain copied backing data (0xBB)
+	for i, b := range buf2 {
+		if b != 0xBB {
+			t.Errorf("Backing data at %d: got 0x%02x, want 0xBB", i, b)
 			break
 		}
 	}
