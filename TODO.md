@@ -118,19 +118,34 @@
 - [x] Clear security warning in API docs
 
 ### LUKS Encryption (modern, method=2)
-> Using [anatol/luks.go](https://github.com/anatol/luks.go) pure Go library for LUKS header parsing
-- [ ] Research QCOW2 LUKS payload storage format (header at special offset)
-- [ ] Add anatol/luks.go dependency
-- [ ] Parse LUKS header from QCOW2 encrypt.format extension
-- [ ] Implement LUKS key derivation (PBKDF2)
-- [ ] Implement sector-level decryption with ESSIV
-- [ ] Read support for LUKS-encrypted images
-- [ ] Future: Write support
+> **Design Doc:** [docs/luks_design.md](docs/luks_design.md) | **Research:** [docs/luks_libraries.md](docs/luks_libraries.md)
+>
+> Hybrid approach: luksy for header parsing, custom key derivation + x/crypto/xts for random-access decryption.
+> Standard LUKS libraries don't support random access (they auto-increment sector IVs), but QCOW2 needs to decrypt scattered clusters at arbitrary physical offsets.
 
-### Extended L2 Entries
-- [ ] Detect incompatible feature bit 4
-- [ ] Parse 128-bit extended L2 entries
-- [ ] 32 subclusters per cluster
+#### Phase 1: LUKS1 Read-Only ✅
+- [x] Parse Full Disk Encryption header extension (0x0537be77)
+- [x] Add containers/luksy dependency for header parsing
+- [x] Implement PBKDF2 key derivation for key slots
+- [x] Implement Anti-Forensic (AF) merge algorithm
+- [x] Implement master key verification against digest
+- [x] Integrate x/crypto/xts for random-access sector decryption
+- [x] Test with qemu-img LUKS1 images
+
+#### Phase 2: LUKS2 Read-Only ✅
+- [x] Add Argon2i/Argon2id key derivation (x/crypto/argon2)
+- [x] Parse LUKS2 JSON metadata via luksy
+- [x] Handle LUKS2-specific key slot format
+- [x] Test with qemu-img LUKS2 images (skipped if qemu < 5.1)
+
+#### Phase 3: Write Support ✅
+- [x] Implement encrypted cluster writes
+- [x] Handle IV generation for new clusters
+
+### Extended L2 Entries ✅
+- [x] Detect incompatible feature bit 4
+- [x] Parse 128-bit extended L2 entries
+- [x] 32 subclusters per cluster (read-only, test skipped if qemu < 5.2)
 
 ### Bitmaps / Dirty Tracking
 - [ ] Bitmap directory parsing

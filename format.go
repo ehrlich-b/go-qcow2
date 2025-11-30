@@ -112,6 +112,16 @@ const (
 	L2EntryZeroFlag   = uint64(1) << 0                // Standard cluster - all zeros
 )
 
+// Extended L2 entry constants (128-bit entries with subcluster bitmaps)
+// Second 64 bits contain: allocation bitmap (bits 0-31) + zero bitmap (bits 32-63)
+const (
+	ExtL2SubclusterCount = 32 // Number of subclusters per cluster
+
+	// Subcluster bitmap masks for the second 64-bit word of extended L2 entries
+	ExtL2AllocBitmapMask = uint64(0x00000000FFFFFFFF) // Bits 0-31: allocation status
+	ExtL2ZeroBitmapMask  = uint64(0xFFFFFFFF00000000) // Bits 32-63: zero status
+)
+
 // L1 entry flags
 const (
 	L1EntryCopied     = uint64(1) << 63
@@ -163,13 +173,13 @@ const MaxBackingChainDepth = 64
 
 // Errors
 var (
-	ErrInvalidMagic           = errors.New("qcow2: invalid magic number")
-	ErrUnsupportedVersion     = errors.New("qcow2: unsupported version")
-	ErrInvalidClusterBits     = errors.New("qcow2: invalid cluster bits")
-	ErrIncompatFeatures       = errors.New("qcow2: unsupported incompatible features")
-	ErrCorruptImage           = errors.New("qcow2: image is marked corrupt")
-	ErrImageDirty             = errors.New("qcow2: image is marked dirty, needs repair")
-	ErrOffsetOutOfRange       = errors.New("qcow2: offset out of range")
+	ErrInvalidMagic             = errors.New("qcow2: invalid magic number")
+	ErrUnsupportedVersion       = errors.New("qcow2: unsupported version")
+	ErrInvalidClusterBits       = errors.New("qcow2: invalid cluster bits")
+	ErrIncompatFeatures         = errors.New("qcow2: unsupported incompatible features")
+	ErrCorruptImage             = errors.New("qcow2: image is marked corrupt")
+	ErrImageDirty               = errors.New("qcow2: image is marked dirty, needs repair")
+	ErrOffsetOutOfRange         = errors.New("qcow2: offset out of range")
 	ErrReadOnly                 = errors.New("qcow2: image is read-only")
 	ErrBackingChainTooDeep      = errors.New("qcow2: backing file chain exceeds maximum depth")
 	ErrUnsupportedCompression   = errors.New("qcow2: unsupported compression type (zstd requires external library)")
@@ -239,7 +249,7 @@ func ParseHeader(data []byte) (*Header, error) {
 
 // Validate checks if the header is valid and if we support all required features.
 func (h *Header) Validate() error {
-	// Check for encryption - we support legacy AES (read-only) and reject LUKS for now
+	// Check for encryption - we support legacy AES and LUKS (read-only)
 	switch h.EncryptMethod {
 	case EncryptionNone:
 		// No encryption, all good
@@ -247,15 +257,14 @@ func (h *Header) Validate() error {
 		// Legacy AES encryption supported (read-only, requires SetPassword)
 		// Note: This is insecure and deprecated, only for data recovery
 	case EncryptionLUKS:
-		// LUKS not yet supported
-		return fmt.Errorf("%w: LUKS encryption (method=2) not yet supported", ErrEncryptedImage)
+		// LUKS encryption supported (read-only, requires SetPasswordLUKS)
 	default:
 		return fmt.Errorf("%w: unknown method=%d", ErrEncryptedImage, h.EncryptMethod)
 	}
 
 	// Check for unsupported incompatible features
-	// We support dirty bit, compression type in header, and external data files
-	supportedIncompat := uint64(IncompatDirtyBit | IncompatCompression | IncompatExternalData)
+	// We support dirty bit, compression type in header, external data files, and extended L2
+	supportedIncompat := uint64(IncompatDirtyBit | IncompatCompression | IncompatExternalData | IncompatExtendedL2)
 	if h.IncompatibleFeatures & ^supportedIncompat != 0 {
 		return fmt.Errorf("%w: 0x%x", ErrIncompatFeatures, h.IncompatibleFeatures)
 	}
@@ -307,6 +316,13 @@ func (h *Header) HasLazyRefcounts() bool {
 // HasExternalDataFile returns true if cluster data is stored in an external file.
 func (h *Header) HasExternalDataFile() bool {
 	return h.IncompatibleFeatures&IncompatExternalData != 0
+}
+
+// HasExtendedL2 returns true if the image uses extended L2 entries (128-bit).
+// Extended L2 entries support 32 subclusters per cluster for finer-grained
+// allocation and zero tracking.
+func (h *Header) HasExtendedL2() bool {
+	return h.IncompatibleFeatures&IncompatExtendedL2 != 0
 }
 
 // Encode serializes the header to bytes.

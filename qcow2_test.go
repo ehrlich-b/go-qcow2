@@ -2195,15 +2195,15 @@ func TestCompressionLevelSettings(t *testing.T) {
 	}
 }
 
-func TestEncryptedImageDetection(t *testing.T) {
+func TestUnknownEncryptionMethodRejected(t *testing.T) {
 	t.Parallel()
 
-	// Test LUKS encryption rejection (method=2)
-	// AES (method=1) is now supported (read-only), LUKS is not yet
+	// Test that unknown encryption methods (>2) are rejected
+	// AES (method=1) and LUKS (method=2) are supported (read-only)
 	dir := t.TempDir()
 	path := filepath.Join(dir, "encrypted.qcow2")
 
-	// Create a minimal QCOW2 header with encryption method = 2 (LUKS)
+	// Create a minimal QCOW2 header with unknown encryption method = 99
 	header := make([]byte, HeaderSizeV3)
 
 	// Magic
@@ -2217,8 +2217,8 @@ func TestEncryptedImageDetection(t *testing.T) {
 	binary.BigEndian.PutUint32(header[20:24], 16)
 	// Virtual size = 1MB
 	binary.BigEndian.PutUint64(header[24:32], 1024*1024)
-	// Encryption method = 2 (LUKS) - THIS SHOULD CAUSE REJECTION
-	binary.BigEndian.PutUint32(header[32:36], EncryptionLUKS)
+	// Unknown encryption method = 99 - THIS SHOULD CAUSE REJECTION
+	binary.BigEndian.PutUint32(header[32:36], 99)
 	// L1 size
 	binary.BigEndian.PutUint32(header[36:40], 1)
 	// L1 table offset
@@ -2231,10 +2231,10 @@ func TestEncryptedImageDetection(t *testing.T) {
 	binary.BigEndian.PutUint32(header[60:64], 0)
 	binary.BigEndian.PutUint64(header[64:72], 0)
 	// V3 fields
-	binary.BigEndian.PutUint64(header[72:80], 0) // Incompatible features
-	binary.BigEndian.PutUint64(header[80:88], 0) // Compatible features
-	binary.BigEndian.PutUint64(header[88:96], 0) // Autoclear features
-	binary.BigEndian.PutUint32(header[96:100], 4) // Refcount order
+	binary.BigEndian.PutUint64(header[72:80], 0)              // Incompatible features
+	binary.BigEndian.PutUint64(header[80:88], 0)              // Compatible features
+	binary.BigEndian.PutUint64(header[88:96], 0)              // Autoclear features
+	binary.BigEndian.PutUint32(header[96:100], 4)             // Refcount order
 	binary.BigEndian.PutUint32(header[100:104], HeaderSizeV3) // Header length
 
 	// Write header to file
@@ -2248,13 +2248,13 @@ func TestEncryptedImageDetection(t *testing.T) {
 	}
 	f.Close()
 
-	// Try to open - should fail with encrypted image error (LUKS not supported)
+	// Try to open - should fail with encrypted image error (unknown method)
 	_, err = Open(path)
 	if err == nil {
-		t.Error("Open should fail for LUKS encrypted image")
+		t.Error("Open should fail for unknown encrypted image method")
 	}
 	if !errors.Is(err, ErrEncryptedImage) {
-		t.Errorf("Expected ErrEncryptedImage for LUKS, got: %v", err)
+		t.Errorf("Expected ErrEncryptedImage for unknown method, got: %v", err)
 	}
 }
 
@@ -2430,5 +2430,95 @@ func TestExternalDataFile(t *testing.T) {
 	checkResult := testutil.QemuCheck(t, imgPath)
 	if !checkResult.IsClean {
 		t.Errorf("qemu-img check failed: %s", checkResult.Stderr)
+	}
+}
+
+func TestExtendedL2Entries(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	imgPath := filepath.Join(dir, "test_extl2.qcow2")
+
+	// Create a qcow2 image with extended L2 entries using qemu-img (requires QEMU >= 5.2)
+	result := testutil.RunQemuImg(t, "create", "-f", "qcow2", "-o", "extended_l2=on", imgPath, "1M")
+	if result.ExitCode != 0 {
+		t.Skipf("qemu-img doesn't support extended_l2: %s", result.Stderr)
+	}
+
+	// Write test pattern using qemu-io at various subcluster offsets
+	subclusterSize := 64 * 1024 / 32 // 2KB subclusters for 64KB clusters
+	result = testutil.RunQemuIO(t, imgPath,
+		fmt.Sprintf("write -P 0xAA 0 %d", subclusterSize),                    // Subcluster 0
+		fmt.Sprintf("write -P 0xBB %d %d", subclusterSize*5, subclusterSize), // Subcluster 5
+	)
+	if result.ExitCode != 0 {
+		t.Fatalf("qemu-io write failed: %s", result.Stderr)
+	}
+
+	// Open the image
+	img, err := Open(imgPath)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer img.Close()
+
+	// Verify extended L2 was detected
+	if !img.header.HasExtendedL2() {
+		t.Fatal("Expected HasExtendedL2() to be true")
+	}
+
+	// Verify the extendedL2 field
+	if !img.extendedL2 {
+		t.Error("Expected img.extendedL2 to be true")
+	}
+
+	// Verify L2 entry size
+	if img.l2EntrySize != 16 {
+		t.Errorf("l2EntrySize = %d, want 16", img.l2EntrySize)
+	}
+
+	// Verify subcluster size
+	expectedSubclusterSize := uint64(img.clusterSize / 32)
+	if img.subclusterSize != expectedSubclusterSize {
+		t.Errorf("subclusterSize = %d, want %d", img.subclusterSize, expectedSubclusterSize)
+	}
+
+	// Read from allocated subcluster 0
+	buf := make([]byte, subclusterSize)
+	n, err := img.ReadAt(buf, 0)
+	if err != nil {
+		t.Fatalf("ReadAt subcluster 0 failed: %v", err)
+	}
+	if n != subclusterSize {
+		t.Errorf("ReadAt = %d, want %d", n, subclusterSize)
+	}
+	for i, b := range buf {
+		if b != 0xAA {
+			t.Errorf("byte %d = 0x%02x, want 0xAA", i, b)
+			break
+		}
+	}
+
+	// Read from allocated subcluster 5
+	n, err = img.ReadAt(buf, int64(subclusterSize*5))
+	if err != nil {
+		t.Fatalf("ReadAt subcluster 5 failed: %v", err)
+	}
+	for i, b := range buf {
+		if b != 0xBB {
+			t.Errorf("byte %d = 0x%02x, want 0xBB", i, b)
+			break
+		}
+	}
+
+	// Read from unallocated subcluster 3 (should return zeros)
+	n, err = img.ReadAt(buf, int64(subclusterSize*3))
+	if err != nil {
+		t.Fatalf("ReadAt subcluster 3 failed: %v", err)
+	}
+	for i, b := range buf {
+		if b != 0x00 {
+			t.Errorf("unallocated byte %d = 0x%02x, want 0x00", i, b)
+			break
+		}
 	}
 }

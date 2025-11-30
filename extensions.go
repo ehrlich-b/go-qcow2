@@ -22,12 +22,19 @@ type HeaderExtension struct {
 	Data   []byte
 }
 
+// EncryptionHeaderPointer contains the location of the LUKS header in the image.
+type EncryptionHeaderPointer struct {
+	Offset uint64 // Offset to encryption header (cluster-aligned)
+	Length uint64 // Length of the encryption header in bytes
+}
+
 // HeaderExtensions holds all parsed header extensions.
 type HeaderExtensions struct {
-	BackingFormat    string            // Backing file format (e.g., "qcow2", "raw")
-	FeatureNames     map[string]string // Feature name table
-	ExternalDataFile string            // External data file name
-	Unknown          []HeaderExtension // Unknown but compatible extensions
+	BackingFormat    string                   // Backing file format (e.g., "qcow2", "raw")
+	FeatureNames     map[string]string        // Feature name table
+	ExternalDataFile string                   // External data file name
+	EncryptionHeader *EncryptionHeaderPointer // LUKS encryption header location (if present)
+	Unknown          []HeaderExtension        // Unknown but compatible extensions
 }
 
 // parseHeaderExtensions reads all header extensions from the image file.
@@ -94,6 +101,17 @@ func (img *Image) parseHeaderExtensions() (*HeaderExtensions, error) {
 
 		case ExtensionExternalDataFile:
 			extensions.ExternalDataFile = string(data)
+
+		case ExtensionFullDiskEncrypt:
+			// Full disk encryption header pointer (16 bytes)
+			// Bytes 0-7: Offset to encryption header
+			// Bytes 8-15: Length of encryption header
+			if len(data) >= 16 {
+				extensions.EncryptionHeader = &EncryptionHeaderPointer{
+					Offset: binary.BigEndian.Uint64(data[0:8]),
+					Length: binary.BigEndian.Uint64(data[8:16]),
+				}
+			}
 
 		default:
 			// Store unknown extensions

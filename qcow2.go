@@ -85,6 +85,15 @@ type Image struct {
 	// AES decryptor for legacy encrypted images (method=1)
 	aesDecryptor *AESDecryptor
 
+	// LUKS decryptor for modern encrypted images (method=2)
+	luksDecryptor *LUKSDecryptor
+
+	// Extended L2 entries support (128-bit entries with 32 subclusters)
+	extendedL2     bool   // True if IncompatExtendedL2 feature is set
+	l2EntrySize    uint32 // 8 for standard, 16 for extended L2
+	subclusterSize uint64 // Cluster size / 32 (only used for extended L2)
+	subclusters    uint32 // Number of subclusters per cluster (32 for extended L2, 1 otherwise)
+
 	// Buffer pool for cluster-sized allocations
 	clusterPool sync.Pool
 }
@@ -252,8 +261,21 @@ func newImage(f *os.File, readOnly bool, chainDepth int) (*Image, error) {
 		barrierMode:   BarrierMetadata, // Default: sync after metadata updates
 	}
 
-	// Calculate l2Bits (log2 of l2Entries)
-	img.l2Bits = header.ClusterBits - 3 // Each L2 entry is 8 bytes
+	// Configure L2 entry handling based on extended L2 feature
+	if header.HasExtendedL2() {
+		img.extendedL2 = true
+		img.l2EntrySize = 16                      // 128-bit entries
+		img.l2Bits = header.ClusterBits - 4       // Each L2 entry is 16 bytes
+		img.l2Entries = img.clusterSize / 16      // Fewer entries per table
+		img.subclusters = 32                      // 32 subclusters per cluster
+		img.subclusterSize = img.clusterSize / 32 // Each subcluster is cluster/32 bytes
+	} else {
+		img.extendedL2 = false
+		img.l2EntrySize = 8                  // 64-bit entries
+		img.l2Bits = header.ClusterBits - 3  // Each L2 entry is 8 bytes
+		img.subclusters = 1                  // No subclusters
+		img.subclusterSize = img.clusterSize // Subcluster = full cluster
+	}
 
 	// Load L1 table
 	if err := img.loadL1Table(); err != nil {
@@ -446,14 +468,22 @@ func (img *Image) ReadAt(p []byte, off int64) (n int, err error) {
 		switch info.ctype {
 		case clusterNormal:
 			// Read from allocated cluster (use dataFile for external data file support)
-			if img.header.EncryptMethod == EncryptionAES {
-				// Encrypted image - need to decrypt
+			switch img.header.EncryptMethod {
+			case EncryptionAES:
+				// Legacy AES encryption - need to decrypt
 				read, err := img.readEncrypted(p[:toRead], info.physOff, uint64(off))
 				n += read
 				if err != nil {
 					return n, err
 				}
-			} else {
+			case EncryptionLUKS:
+				// LUKS encryption - need to decrypt
+				read, err := img.readLUKSEncrypted(p[:toRead], info.physOff, uint64(off))
+				n += read
+				if err != nil {
+					return n, err
+				}
+			default:
 				// Normal unencrypted read
 				read, err := img.dataFile().ReadAt(p[:toRead], int64(info.physOff))
 				n += read
@@ -520,9 +550,19 @@ func (img *Image) WriteAt(p []byte, off int64) (n int, err error) {
 		return 0, ErrReadOnly
 	}
 
-	// Writing to encrypted images is not supported
-	if img.header.EncryptMethod != EncryptionNone {
-		return 0, fmt.Errorf("qcow2: writing to encrypted images is not supported")
+	// Check encryption support
+	switch img.header.EncryptMethod {
+	case EncryptionNone:
+		// No encryption, continue normally
+	case EncryptionLUKS:
+		// LUKS encryption supported - use encrypted write path
+		if img.luksDecryptor == nil {
+			return 0, fmt.Errorf("qcow2: LUKS encrypted image requires password (call SetPasswordLUKS)")
+		}
+		return img.writeAtLUKS(p, off)
+	default:
+		// Legacy AES encryption not supported for writes
+		return 0, fmt.Errorf("qcow2: writing to AES-encrypted images is not supported")
 	}
 
 	if off < 0 {
@@ -568,6 +608,90 @@ func (img *Image) WriteAt(p []byte, off int64) (n int, err error) {
 	return n, nil
 }
 
+// writeAtLUKS handles writes to LUKS-encrypted images.
+// It encrypts data before writing and handles partial cluster writes correctly.
+func (img *Image) writeAtLUKS(p []byte, off int64) (n int, err error) {
+	if off < 0 {
+		return 0, ErrOffsetOutOfRange
+	}
+
+	size := img.Size()
+	if off >= size {
+		return 0, ErrOffsetOutOfRange
+	}
+
+	// Clamp write to image size
+	if off+int64(len(p)) > size {
+		p = p[:size-off]
+	}
+
+	for len(p) > 0 {
+		// Calculate how much we can write in this cluster
+		clusterOff := uint64(off) & img.offsetMask
+		toWrite := img.clusterSize - clusterOff
+		if toWrite > uint64(len(p)) {
+			toWrite = uint64(len(p))
+		}
+
+		// Check if cluster was previously allocated (before getClusterForWrite may allocate it)
+		wasAllocated := img.isClusterAllocated(uint64(off))
+
+		// Get or allocate physical cluster
+		physOff, err := img.getClusterForWrite(uint64(off))
+		if err != nil {
+			return n, err
+		}
+
+		// For LUKS: handle encryption
+		// isNewCluster means the cluster was NOT previously allocated
+		isNewCluster := !wasAllocated
+
+		// Write encrypted data
+		written, err := img.writeLUKSEncrypted(p[:toWrite], physOff, isNewCluster)
+		n += written
+		if err != nil {
+			return n, err
+		}
+
+		p = p[toWrite:]
+		off += int64(toWrite)
+	}
+
+	img.dirty = true
+	return n, nil
+}
+
+// isClusterAllocated checks if a cluster at the given virtual offset is already allocated.
+// This is used to determine if we need to read existing data before a partial write.
+func (img *Image) isClusterAllocated(virtOff uint64) bool {
+	l2Index := (virtOff >> img.clusterBits) & (img.l2Entries - 1)
+	l1Index := virtOff >> (img.clusterBits + img.l2Bits)
+
+	// Check L1 bounds
+	if l1Index >= uint64(len(img.l1Table)/8) {
+		return false
+	}
+
+	// Get L2 table offset from L1
+	l1Entry := binary.BigEndian.Uint64(img.l1Table[l1Index*8:])
+	l2TableOff := l1Entry & L2EntryOffsetMask
+	if l2TableOff == 0 {
+		return false
+	}
+
+	// Get L2 table
+	l2Table, err := img.getL2Table(l2TableOff)
+	if err != nil {
+		return false
+	}
+
+	// Check L2 entry
+	l2Entry := binary.BigEndian.Uint64(l2Table[l2Index*8:])
+	physOff := l2Entry & L2EntryOffsetMask
+
+	return physOff != 0
+}
+
 // clusterType represents the type of a cluster
 type clusterType int
 
@@ -583,6 +707,9 @@ type clusterInfo struct {
 	ctype   clusterType
 	physOff uint64 // Physical offset (0 for unallocated/zero)
 	l2Entry uint64 // Raw L2 entry (needed for compressed clusters)
+
+	// Extended L2 fields (for subcluster-level allocation)
+	extL2Bitmap uint64 // Second 64-bit word of extended L2 entry
 }
 
 // translate converts a virtual offset to cluster information.
@@ -613,10 +740,17 @@ func (img *Image) translate(virtOff uint64) (clusterInfo, error) {
 		return clusterInfo{}, err
 	}
 
-	// Read L2 entry
-	l2Entry := binary.BigEndian.Uint64(l2Table[l2Index*8:])
+	// Read L2 entry (8 bytes for standard, first 8 of 16 for extended)
+	entryOffset := l2Index * uint64(img.l2EntrySize)
+	l2Entry := binary.BigEndian.Uint64(l2Table[entryOffset:])
 
-	// Check if compressed
+	// Read extended L2 bitmap if applicable
+	var extL2Bitmap uint64
+	if img.extendedL2 {
+		extL2Bitmap = binary.BigEndian.Uint64(l2Table[entryOffset+8:])
+	}
+
+	// Check if compressed (not supported with extended L2 in QEMU)
 	if l2Entry&L2EntryCompressed != 0 {
 		return clusterInfo{
 			ctype:   clusterCompressed,
@@ -624,7 +758,12 @@ func (img *Image) translate(virtOff uint64) (clusterInfo, error) {
 		}, nil
 	}
 
-	// Check for zero cluster (bit 0 set)
+	// For extended L2, check subcluster status
+	if img.extendedL2 {
+		return img.translateExtendedL2(virtOff, l2Entry, extL2Bitmap)
+	}
+
+	// Standard L2: Check for zero cluster (bit 0 set)
 	if l2Entry&L2EntryZeroFlag != 0 {
 		return clusterInfo{ctype: clusterZero}, nil
 	}
@@ -639,6 +778,43 @@ func (img *Image) translate(virtOff uint64) (clusterInfo, error) {
 	return clusterInfo{
 		ctype:   clusterNormal,
 		physOff: physOff + (virtOff & img.offsetMask),
+	}, nil
+}
+
+// translateExtendedL2 handles translation for extended L2 entries with subclusters.
+func (img *Image) translateExtendedL2(virtOff uint64, l2Entry uint64, extL2Bitmap uint64) (clusterInfo, error) {
+	// Calculate which subcluster within the cluster
+	intraClusterOff := virtOff & img.offsetMask
+	subclusterIndex := intraClusterOff / img.subclusterSize
+
+	// Check the allocation and zero bitmaps for this subcluster
+	allocBit := (extL2Bitmap >> subclusterIndex) & 1
+	zeroBit := (extL2Bitmap >> (32 + subclusterIndex)) & 1
+
+	// Extract physical cluster offset
+	physClusterOff := l2Entry & L2EntryOffsetMask
+
+	// Interpret the subcluster status
+	if allocBit == 0 {
+		if zeroBit != 0 {
+			// Subcluster is explicitly zero
+			return clusterInfo{ctype: clusterZero}, nil
+		}
+		// Subcluster is unallocated (read from backing or return zeros)
+		return clusterInfo{ctype: clusterUnallocated}, nil
+	}
+
+	// allocBit == 1: subcluster is allocated
+	if physClusterOff == 0 {
+		// This shouldn't happen for allocated subclusters
+		return clusterInfo{ctype: clusterUnallocated}, nil
+	}
+
+	// Return physical offset including intra-cluster offset
+	return clusterInfo{
+		ctype:       clusterNormal,
+		physOff:     physClusterOff + intraClusterOff,
+		extL2Bitmap: extL2Bitmap,
 	}, nil
 }
 
