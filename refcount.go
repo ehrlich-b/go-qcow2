@@ -310,8 +310,8 @@ func (img *Image) allocateRefcountBlock(tableIndex uint64) (uint64, error) {
 	}
 
 	// Zero the new block
-	zeros := make([]byte, img.clusterSize)
-	if _, err := img.file.WriteAt(zeros, int64(offset)); err != nil {
+	block := make([]byte, img.clusterSize)
+	if _, err := img.file.WriteAt(block, int64(offset)); err != nil {
 		return 0, err
 	}
 
@@ -325,11 +325,51 @@ func (img *Image) allocateRefcountBlock(tableIndex uint64) (uint64, error) {
 		return 0, fmt.Errorf("qcow2: failed to update refcount table: %w", err)
 	}
 
-	// The new refcount block itself needs a refcount of 1
-	// But we need to be careful not to recurse infinitely
-	// The block we just allocated might be tracked by itself or by an existing block
-	// For now, we'll update the refcount after returning
-	// This is handled by the caller
+	// Set refcount for the new block itself to 1.
+	// Calculate which refcount block tracks this new block.
+	refcountBits := img.header.RefcountBits()
+	refcountBytes := refcountBits / 8
+	if refcountBytes == 0 {
+		refcountBytes = 1
+	}
+	entriesPerBlock := img.clusterSize / uint64(refcountBytes)
+
+	newBlockClusterIndex := offset >> img.clusterBits
+	newBlockTableIndex := newBlockClusterIndex / entriesPerBlock
+	newBlockBlockIndex := newBlockClusterIndex % entriesPerBlock
+
+	if newBlockTableIndex == tableIndex {
+		// Self-referential: the new block tracks its own refcount.
+		// Write directly to the block we just allocated.
+		writeRefcountEntry(block, newBlockBlockIndex, refcountBits, 1)
+		if _, err := img.file.WriteAt(block, int64(offset)); err != nil {
+			return 0, fmt.Errorf("qcow2: failed to write self-referential refcount: %w", err)
+		}
+		img.refcountBlockCache.put(offset, block)
+	} else {
+		// Different block tracks this one - read it, update, write back.
+		// Check if that block exists.
+		if newBlockTableIndex < uint64(len(img.refcountTable))/8 {
+			trackingBlockOffset := binary.BigEndian.Uint64(img.refcountTable[newBlockTableIndex*8:])
+			if trackingBlockOffset != 0 {
+				trackingBlock := img.refcountBlockCache.get(trackingBlockOffset)
+				if trackingBlock == nil {
+					trackingBlock = make([]byte, img.clusterSize)
+					if _, err := img.file.ReadAt(trackingBlock, int64(trackingBlockOffset)); err != nil {
+						return 0, fmt.Errorf("qcow2: failed to read tracking refcount block: %w", err)
+					}
+				}
+				writeRefcountEntry(trackingBlock, newBlockBlockIndex, refcountBits, 1)
+				if _, err := img.file.WriteAt(trackingBlock, int64(trackingBlockOffset)); err != nil {
+					return 0, fmt.Errorf("qcow2: failed to write tracking refcount block: %w", err)
+				}
+				img.refcountBlockCache.put(trackingBlockOffset, trackingBlock)
+			}
+			// If trackingBlockOffset == 0, we'd need another allocation (rare edge case).
+			// This would require recursive allocation which we avoid by letting
+			// rebuildRefcounts fix it on next open if lazy_refcounts is enabled.
+		}
+	}
 
 	return offset, nil
 }

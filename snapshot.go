@@ -367,16 +367,16 @@ func (img *Image) CreateSnapshot(name string) (*Snapshot, error) {
 	}
 	img.l1Mu.Unlock()
 
-	// Allocate clusters for the new L1 table
+	// Allocate clusters for the new L1 table (metadata always in main qcow2 file)
 	l1Clusters := (l1TableSize + img.clusterSize - 1) / img.clusterSize
-	newL1Offset, err := img.allocateCluster()
+	newL1Offset, err := img.allocateMetadataCluster()
 	if err != nil {
 		return nil, fmt.Errorf("qcow2: failed to allocate cluster for snapshot L1 table: %w", err)
 	}
 
 	// If L1 table spans multiple clusters, allocate the rest
 	for i := uint64(1); i < l1Clusters; i++ {
-		nextCluster, err := img.allocateCluster()
+		nextCluster, err := img.allocateMetadataCluster()
 		if err != nil {
 			return nil, fmt.Errorf("qcow2: failed to allocate cluster for snapshot L1 table: %w", err)
 		}
@@ -522,15 +522,15 @@ func (img *Image) writeSnapshotTable(newSnap *Snapshot) error {
 	// Calculate clusters needed
 	tableClusters := (uint64(len(tableData)) + img.clusterSize - 1) / img.clusterSize
 
-	// Allocate clusters for the new snapshot table
-	newTableOffset, err := img.allocateCluster()
+	// Allocate clusters for the new snapshot table (metadata always in main qcow2 file)
+	newTableOffset, err := img.allocateMetadataCluster()
 	if err != nil {
 		return fmt.Errorf("failed to allocate cluster for snapshot table: %w", err)
 	}
 
 	// Allocate remaining clusters if needed
 	for i := uint64(1); i < tableClusters; i++ {
-		nextCluster, err := img.allocateCluster()
+		nextCluster, err := img.allocateMetadataCluster()
 		if err != nil {
 			return fmt.Errorf("failed to allocate cluster for snapshot table: %w", err)
 		}
@@ -736,15 +736,15 @@ func (img *Image) rewriteSnapshotTable() error {
 	// Calculate clusters needed
 	tableClusters := (uint64(len(tableData)) + img.clusterSize - 1) / img.clusterSize
 
-	// Allocate clusters for the new snapshot table
-	newTableOffset, err := img.allocateCluster()
+	// Allocate clusters for the new snapshot table (metadata always in main qcow2 file)
+	newTableOffset, err := img.allocateMetadataCluster()
 	if err != nil {
 		return fmt.Errorf("failed to allocate cluster for snapshot table: %w", err)
 	}
 
 	// Allocate remaining clusters if needed
 	for i := uint64(1); i < tableClusters; i++ {
-		nextCluster, err := img.allocateCluster()
+		nextCluster, err := img.allocateMetadataCluster()
 		if err != nil {
 			return fmt.Errorf("failed to allocate cluster for snapshot table: %w", err)
 		}

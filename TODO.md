@@ -1,5 +1,7 @@
 # TODO - go-qcow2 Roadmap
 
+See also [REVIEW_TODO.md](REVIEW_TODO.md) for review-driven fixes and checks.
+
 ## Phase 1: Core Functionality ✅ COMPLETE
 
 - [x] Project setup (go.mod, README, CLAUDE.md)

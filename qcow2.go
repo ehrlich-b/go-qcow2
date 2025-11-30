@@ -95,7 +95,8 @@ type Image struct {
 	subclusters    uint32 // Number of subclusters per cluster (32 for extended L2, 1 otherwise)
 
 	// Bitmap extension data (for dirty tracking bitmaps)
-	bitmapExt *bitmapExtension
+	bitmapExt          *bitmapExtension
+	bitmapsInvalidated bool // True after bitmaps have been marked as in-use on first write
 
 	// Buffer pool for cluster-sized allocations
 	clusterPool sync.Pool
@@ -559,6 +560,13 @@ func (img *Image) WriteAt(p []byte, off int64) (n int, err error) {
 		return 0, ErrReadOnly
 	}
 
+	// Extended L2 images (with subcluster allocation) are read-only for now.
+	// The write path doesn't properly update subcluster bitmaps which would
+	// corrupt the metadata. Full subcluster write support is not yet implemented.
+	if img.extendedL2 {
+		return 0, fmt.Errorf("qcow2: writing to extended L2 images (subcluster allocation) is not yet supported")
+	}
+
 	// Check encryption support
 	switch img.header.EncryptMethod {
 	case EncryptionNone:
@@ -586,6 +594,15 @@ func (img *Image) WriteAt(p []byte, off int64) (n int, err error) {
 	// Clamp write to image size
 	if off+int64(len(p)) > size {
 		p = p[:size-off]
+	}
+
+	// Invalidate any persistent bitmaps on first write
+	// This marks them as in-use so consumers know they're stale
+	if !img.bitmapsInvalidated && img.hasBitmaps() {
+		if err := img.invalidateBitmaps(); err != nil {
+			return 0, fmt.Errorf("qcow2: failed to invalidate bitmaps: %w", err)
+		}
+		img.bitmapsInvalidated = true
 	}
 
 	for len(p) > 0 {
@@ -632,6 +649,14 @@ func (img *Image) writeAtLUKS(p []byte, off int64) (n int, err error) {
 	// Clamp write to image size
 	if off+int64(len(p)) > size {
 		p = p[:size-off]
+	}
+
+	// Invalidate any persistent bitmaps on first write
+	if !img.bitmapsInvalidated && img.hasBitmaps() {
+		if err := img.invalidateBitmaps(); err != nil {
+			return 0, fmt.Errorf("qcow2: failed to invalidate bitmaps: %w", err)
+		}
+		img.bitmapsInvalidated = true
 	}
 
 	for len(p) > 0 {
@@ -873,7 +898,7 @@ func (img *Image) getOrAllocateL2Table(l1Index uint64) (uint64, error) {
 
 			if refcount > 1 {
 				// L2 table is shared - need to COW
-				newL2TableOff, err := img.allocateCluster()
+				newL2TableOff, err := img.allocateMetadataCluster()
 				if err != nil {
 					return 0, fmt.Errorf("qcow2: failed to allocate L2 table for COW: %w", err)
 				}
@@ -928,9 +953,9 @@ func (img *Image) getOrAllocateL2Table(l1Index uint64) (uint64, error) {
 		return l2TableOff, nil
 	}
 
-	// Need to allocate new L2 table
+	// Need to allocate new L2 table (metadata always in main qcow2 file)
 	var err error
-	l2TableOff, err = img.allocateCluster()
+	l2TableOff, err = img.allocateMetadataCluster()
 	if err != nil {
 		return 0, err
 	}
@@ -968,6 +993,7 @@ func (img *Image) getOrAllocateL2Table(l1Index uint64) (uint64, error) {
 
 // getClusterForWrite returns the physical offset for writing.
 // Allocates a new cluster if needed, or performs COW if the cluster is shared.
+// Handles compressed and zero-flagged clusters by decompressing/allocating as needed.
 func (img *Image) getClusterForWrite(virtOff uint64) (uint64, error) {
 	// Calculate L1 and L2 indices
 	l2Index := (virtOff >> img.clusterBits) & (img.l2Entries - 1)
@@ -987,6 +1013,19 @@ func (img *Image) getClusterForWrite(virtOff uint64) (uint64, error) {
 
 	// Check L2 entry
 	l2Entry := binary.BigEndian.Uint64(l2Table[l2Index*8:])
+
+	// Handle compressed clusters - must decompress and reallocate
+	isCompressed := l2Entry&L2EntryCompressed != 0
+	if isCompressed {
+		return img.decompressClusterForWrite(virtOff, l2Entry, l2Table, l2TableOff, l2Index)
+	}
+
+	// Handle zero-flagged clusters - must allocate new cluster
+	isZero := l2Entry&L2EntryZeroFlag != 0
+	if isZero {
+		return img.allocateZeroClusterForWrite(virtOff, l2Entry, l2Table, l2TableOff, l2Index)
+	}
+
 	physOff := l2Entry & L2EntryOffsetMask
 	isCopied := l2Entry&L2EntryCopied != 0
 
@@ -1087,7 +1126,112 @@ func (img *Image) getClusterForWrite(virtOff uint64) (uint64, error) {
 	return physOff + (virtOff & img.offsetMask), nil
 }
 
-// allocateCluster finds and allocates a new cluster.
+// decompressClusterForWrite handles writing to a compressed cluster by
+// decompressing it to a new normal cluster.
+func (img *Image) decompressClusterForWrite(virtOff uint64, l2Entry uint64, l2Table []byte, l2TableOff uint64, l2Index uint64) (uint64, error) {
+	// Decompress the cluster
+	decompressed, err := img.decompressCluster(l2Entry)
+	if err != nil {
+		return 0, fmt.Errorf("qcow2: failed to decompress cluster for write: %w", err)
+	}
+
+	// Allocate a new normal cluster
+	physOff, err := img.allocateCluster()
+	if err != nil {
+		return 0, fmt.Errorf("qcow2: failed to allocate cluster for decompressed data: %w", err)
+	}
+
+	// Write the decompressed data to the new cluster
+	dataFile := img.dataFile()
+	if _, err := dataFile.WriteAt(decompressed, int64(physOff)); err != nil {
+		return 0, fmt.Errorf("qcow2: failed to write decompressed cluster: %w", err)
+	}
+
+	// Barrier: ensure data is on disk before L2 points to it
+	if err := img.dataBarrier(); err != nil {
+		return 0, fmt.Errorf("qcow2: data barrier failed: %w", err)
+	}
+
+	// Update L2 entry to point to the new normal cluster (clear compressed flag, set COPIED)
+	newL2Entry := physOff | L2EntryCopied
+	binary.BigEndian.PutUint64(l2Table[l2Index*8:], newL2Entry)
+
+	// Write L2 entry to disk
+	if _, err := img.file.WriteAt(l2Table[l2Index*8:l2Index*8+8],
+		int64(l2TableOff+l2Index*8)); err != nil {
+		return 0, fmt.Errorf("qcow2: failed to write L2 entry: %w", err)
+	}
+
+	// Barrier: ensure L2 update is on disk
+	if err := img.metadataBarrier(); err != nil {
+		return 0, fmt.Errorf("qcow2: L2 update barrier failed: %w", err)
+	}
+
+	// Update cache and invalidate compressed cache entry
+	img.l2Cache.put(l2TableOff, l2Table)
+	img.compressedCache.cache.invalidate(l2Entry) // Invalidate old compressed cache entry
+
+	// Return offset with intra-cluster offset
+	return physOff + (virtOff & img.offsetMask), nil
+}
+
+// allocateZeroClusterForWrite handles writing to a zero-flagged cluster by
+// allocating a new cluster with the appropriate initial content.
+func (img *Image) allocateZeroClusterForWrite(virtOff uint64, l2Entry uint64, l2Table []byte, l2TableOff uint64, l2Index uint64) (uint64, error) {
+	oldPhysOff := l2Entry & L2EntryOffsetMask
+
+	// Allocate a new cluster
+	physOff, err := img.allocateCluster()
+	if err != nil {
+		return 0, fmt.Errorf("qcow2: failed to allocate cluster for zero write: %w", err)
+	}
+
+	// For ZERO_ALLOC (has old offset), decrement the old refcount
+	// For ZERO_PLAIN (no offset), nothing to decrement
+	if oldPhysOff != 0 {
+		if err := img.decrementRefcount(oldPhysOff); err != nil {
+			return 0, fmt.Errorf("qcow2: failed to decrement old zero-alloc cluster refcount: %w", err)
+		}
+	}
+
+	// Initialize the new cluster with zeros (caller will overwrite partially)
+	dataFile := img.dataFile()
+	zeros := img.getZeroedClusterBuffer()
+	if _, err := dataFile.WriteAt(zeros, int64(physOff)); err != nil {
+		img.putClusterBuffer(zeros)
+		return 0, fmt.Errorf("qcow2: failed to zero new cluster: %w", err)
+	}
+	img.putClusterBuffer(zeros)
+
+	// Barrier: ensure data is on disk before L2 points to it
+	if err := img.dataBarrier(); err != nil {
+		return 0, fmt.Errorf("qcow2: data barrier failed: %w", err)
+	}
+
+	// Update L2 entry: clear zero flag, set COPIED flag
+	newL2Entry := physOff | L2EntryCopied
+	binary.BigEndian.PutUint64(l2Table[l2Index*8:], newL2Entry)
+
+	// Write L2 entry to disk
+	if _, err := img.file.WriteAt(l2Table[l2Index*8:l2Index*8+8],
+		int64(l2TableOff+l2Index*8)); err != nil {
+		return 0, fmt.Errorf("qcow2: failed to write L2 entry: %w", err)
+	}
+
+	// Barrier: ensure L2 update is on disk
+	if err := img.metadataBarrier(); err != nil {
+		return 0, fmt.Errorf("qcow2: L2 update barrier failed: %w", err)
+	}
+
+	// Update cache
+	img.l2Cache.put(l2TableOff, l2Table)
+
+	// Return offset with intra-cluster offset
+	return physOff + (virtOff & img.offsetMask), nil
+}
+
+// allocateCluster allocates a new data cluster.
+// For images with external data files, this allocates in the external file.
 // First tries to reuse a free cluster (refcount == 0), then grows the file.
 // It also updates the refcount for the new cluster.
 func (img *Image) allocateCluster() (uint64, error) {
@@ -1095,8 +1239,9 @@ func (img *Image) allocateCluster() (uint64, error) {
 	// This is because refcounts aren't updated in lazy mode, so we can't
 	// reliably determine which clusters are free.
 	dataFile := img.dataFile() // Use external data file if present
-	if !img.lazyRefcounts {
-		// Try to find a free cluster first
+	if !img.lazyRefcounts && img.externalDataFile == nil {
+		// Try to find a free cluster first (only for non-external data images)
+		// Free cluster bitmap tracks qcow2 file, not external data file
 		if offset, found := img.findFreeCluster(); found {
 			// Zero the cluster before reuse
 			zeros := make([]byte, img.clusterSize)
@@ -1127,6 +1272,59 @@ func (img *Image) allocateCluster() (uint64, error) {
 
 	// Extend file
 	if err := dataFile.Truncate(int64(offset + img.clusterSize)); err != nil {
+		return 0, err
+	}
+
+	// Grow bitmap if it exists to track the new cluster (only for non-external)
+	if img.freeBitmap != nil && img.externalDataFile == nil {
+		newNumClusters := (offset + img.clusterSize) >> img.clusterBits
+		img.freeBitmap.grow(newNumClusters)
+	}
+
+	// Update refcount for the new cluster (refcounts always in main qcow2 file)
+	if err := img.incrementRefcount(offset); err != nil {
+		return 0, fmt.Errorf("qcow2: failed to update refcount for new cluster: %w", err)
+	}
+
+	return offset, nil
+}
+
+// allocateMetadataCluster allocates a new cluster for metadata (L2 tables, snapshot data, etc).
+// Metadata is always allocated in the main qcow2 file, never in external data files.
+func (img *Image) allocateMetadataCluster() (uint64, error) {
+	// In lazy refcounts mode, skip free cluster search
+	if !img.lazyRefcounts {
+		// Try to find a free cluster first
+		if offset, found := img.findFreeCluster(); found {
+			// Zero the cluster before reuse
+			zeros := make([]byte, img.clusterSize)
+			if _, err := img.file.WriteAt(zeros, int64(offset)); err != nil {
+				return 0, err
+			}
+
+			// Update refcount for the reused cluster
+			if err := img.incrementRefcount(offset); err != nil {
+				return 0, fmt.Errorf("qcow2: failed to update refcount for reused cluster: %w", err)
+			}
+
+			return offset, nil
+		}
+	}
+
+	// No free clusters found, grow the main qcow2 file
+	info, err := img.file.Stat()
+	if err != nil {
+		return 0, err
+	}
+
+	// Align to cluster boundary
+	offset := uint64(info.Size())
+	if offset&img.offsetMask != 0 {
+		offset = (offset + img.clusterSize) & ^img.offsetMask
+	}
+
+	// Extend file
+	if err := img.file.Truncate(int64(offset + img.clusterSize)); err != nil {
 		return 0, err
 	}
 
@@ -1458,6 +1656,11 @@ func (img *Image) WriteZeroAtMode(off int64, length int64, mode ZeroMode) error 
 		return ErrReadOnly
 	}
 
+	// Extended L2 images are read-only for now
+	if img.extendedL2 {
+		return fmt.Errorf("qcow2: writing to extended L2 images (subcluster allocation) is not yet supported")
+	}
+
 	if off < 0 {
 		return ErrOffsetOutOfRange
 	}
@@ -1470,6 +1673,14 @@ func (img *Image) WriteZeroAtMode(off int64, length int64, mode ZeroMode) error 
 	// Clamp to image size
 	if off+length > size {
 		length = size - off
+	}
+
+	// Invalidate any persistent bitmaps on first write
+	if !img.bitmapsInvalidated && img.hasBitmaps() {
+		if err := img.invalidateBitmaps(); err != nil {
+			return fmt.Errorf("qcow2: failed to invalidate bitmaps: %w", err)
+		}
+		img.bitmapsInvalidated = true
 	}
 
 	for length > 0 {

@@ -380,6 +380,11 @@ func (img *Image) WriteAtCompressed(data []byte, off int64) (int, error) {
 		return 0, ErrReadOnly
 	}
 
+	// Extended L2 images are read-only for now
+	if img.extendedL2 {
+		return 0, fmt.Errorf("qcow2: writing to extended L2 images (subcluster allocation) is not yet supported")
+	}
+
 	if off < 0 {
 		return 0, ErrOffsetOutOfRange
 	}
@@ -397,6 +402,14 @@ func (img *Image) WriteAtCompressed(data []byte, off int64) (int, error) {
 	// Check bounds
 	if off >= img.Size() {
 		return 0, ErrOffsetOutOfRange
+	}
+
+	// Invalidate any persistent bitmaps on first write
+	if !img.bitmapsInvalidated && img.hasBitmaps() {
+		if err := img.invalidateBitmaps(); err != nil {
+			return 0, fmt.Errorf("qcow2: failed to invalidate bitmaps: %w", err)
+		}
+		img.bitmapsInvalidated = true
 	}
 
 	// Try compressed write

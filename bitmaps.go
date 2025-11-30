@@ -462,6 +462,62 @@ func (b *Bitmap) CountDirtyBits() (uint64, error) {
 	return count, nil
 }
 
+// invalidateBitmaps marks all bitmaps as in-use (inconsistent) when the image
+// is modified. This ensures consumers know the bitmaps are stale after writes.
+// Called on first write to an image with bitmaps.
+func (img *Image) invalidateBitmaps() error {
+	if img.bitmapExt == nil {
+		return nil // No bitmaps
+	}
+
+	// Read bitmap directory
+	dirData := make([]byte, img.bitmapExt.directorySize)
+	if _, err := img.file.ReadAt(dirData, int64(img.bitmapExt.directoryOffset)); err != nil {
+		return fmt.Errorf("qcow2: failed to read bitmap directory: %w", err)
+	}
+
+	// Parse and update each directory entry's flags
+	modified := false
+	offset := 0
+	for i := uint32(0); i < img.bitmapExt.nbBitmaps && offset < len(dirData); i++ {
+		// Parse entry to get size
+		if len(dirData[offset:]) < 24 {
+			break
+		}
+
+		flags := binary.BigEndian.Uint32(dirData[offset+12 : offset+16])
+		nameSize := binary.BigEndian.Uint16(dirData[offset+18 : offset+20])
+		extraDataSize := binary.BigEndian.Uint32(dirData[offset+20 : offset+24])
+
+		// Calculate entry size
+		entrySize := 24 + int(extraDataSize) + int(nameSize)
+		paddedSize := (entrySize + 7) & ^7
+
+		// Set the in-use flag if not already set
+		if flags&BitmapFlagInUse == 0 {
+			flags |= BitmapFlagInUse
+			binary.BigEndian.PutUint32(dirData[offset+12:offset+16], flags)
+			modified = true
+		}
+
+		offset += paddedSize
+	}
+
+	// Write back if modified
+	if modified {
+		if _, err := img.file.WriteAt(dirData, int64(img.bitmapExt.directoryOffset)); err != nil {
+			return fmt.Errorf("qcow2: failed to update bitmap directory: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// hasBitmaps returns true if the image has any bitmaps.
+func (img *Image) hasBitmaps() bool {
+	return img.bitmapExt != nil && img.bitmapExt.nbBitmaps > 0
+}
+
 // popcount8 returns the number of set bits in a byte.
 func popcount8(b byte) int {
 	// Use lookup table for speed
