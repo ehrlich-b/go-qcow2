@@ -232,7 +232,16 @@ See also [REVIEW_TODO.md](REVIEW_TODO.md) for review-driven fixes and checks.
 5. **Lazy refcounts**: Skip refcount updates during writes, rebuild from L1/L2 on dirty open
 6. **Write ordering barriers**: Configurable via WriteBarrierMode (None/Batched/Metadata/Full)
 
+### Known Issues
+1. **Concurrency bugs**: Concurrent writes from multiple goroutines can cause refcount mismatches and leaked clusters. Race conditions exist in:
+   - `freeClusterBitmap.setUsed()` / `grow()` - unsynchronized bitmap access
+   - L2 cache - writes and reads racing on cached data
+   - L2 table entry updates - modifications while being written to disk
+
+   Tests `TestConcurrencyStress` and `TestConcurrencyMixedOperations` in `regression_test.go` expose these issues (currently skipped).
+
 ### Open Questions
 1. Should we support mmap for large images?
 2. io_uring: goroutine-per-request vs event loop?
 3. How aggressive should lazy refcount flushing be?
+4. How to properly synchronize concurrent writes without excessive lock contention?
