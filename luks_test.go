@@ -8,7 +8,13 @@ import (
 	"testing"
 )
 
+// LUKS tests are slow due to intentionally expensive key derivation (PBKDF2/Argon2).
+// Skip with -short flag for fast CI runs.
+
 func TestLUKSEncryptedImage(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping LUKS test in short mode (slow key derivation)")
+	}
 	// Skip if qemu-img not available
 	if _, err := exec.LookPath("qemu-img"); err != nil {
 		t.Skip("qemu-img not available")
@@ -79,6 +85,9 @@ func TestLUKSEncryptedImage(t *testing.T) {
 }
 
 func TestLUKSWrongPassword(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping LUKS test in short mode (slow key derivation)")
+	}
 	// Skip if qemu-img not available
 	if _, err := exec.LookPath("qemu-img"); err != nil {
 		t.Skip("qemu-img not available")
@@ -112,6 +121,9 @@ func TestLUKSWrongPassword(t *testing.T) {
 }
 
 func TestLUKS2EncryptedImage(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping LUKS test in short mode (slow key derivation)")
+	}
 	// Skip if qemu-img not available
 	if _, err := exec.LookPath("qemu-img"); err != nil {
 		t.Skip("qemu-img not available")
@@ -175,6 +187,9 @@ func TestLUKS2EncryptedImage(t *testing.T) {
 }
 
 func TestLUKSEncryptedWrite(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping LUKS test in short mode (slow key derivation)")
+	}
 	// Skip if qemu-img not available
 	if _, err := exec.LookPath("qemu-img"); err != nil {
 		t.Skip("qemu-img not available")
@@ -235,6 +250,9 @@ func TestLUKSEncryptedWrite(t *testing.T) {
 }
 
 func TestLUKSEncryptedWritePartialCluster(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping LUKS test in short mode (slow key derivation)")
+	}
 	// Skip if qemu-img not available
 	if _, err := exec.LookPath("qemu-img"); err != nil {
 		t.Skip("qemu-img not available")
@@ -322,6 +340,9 @@ func TestLUKSEncryptedWritePartialCluster(t *testing.T) {
 }
 
 func TestLUKSEncryptedWriteReadRoundtrip(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping LUKS test in short mode (slow key derivation)")
+	}
 	// Skip if qemu-img not available
 	if _, err := exec.LookPath("qemu-img"); err != nil {
 		t.Skip("qemu-img not available")
@@ -386,6 +407,9 @@ func TestLUKSEncryptedWriteReadRoundtrip(t *testing.T) {
 }
 
 func TestLUKSWriteWithoutPassword(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping LUKS test in short mode (slow key derivation)")
+	}
 	// Skip if qemu-img not available
 	if _, err := exec.LookPath("qemu-img"); err != nil {
 		t.Skip("qemu-img not available")

@@ -1,4 +1,4 @@
-.PHONY: all build test test-verbose test-race test-cover bench lint fmt vet clean check help qemu-test fuzz fuzz-quick fuzz-medium fuzz-full test-all profile-cpu profile-mem profile-all profile-trace profile-block docker-build docker-test docker-test-verbose docker-check docker-bench docker-qemu-img
+.PHONY: all build test test-full test-verbose test-verbose-full test-race test-race-full test-cover test-cover-full bench lint fmt vet clean check help qemu-test fuzz fuzz-quick fuzz-medium fuzz-full test-all profile-cpu profile-mem profile-all profile-trace profile-block docker-build docker-test docker-test-verbose docker-check docker-bench docker-qemu-img
 
 # Go parameters
 GOCMD=go
@@ -19,20 +19,37 @@ all: check build test
 build:
 	$(GOBUILD) -v ./...
 
-## test: Run tests
+## test: Run fast tests (< 10 seconds, skips LUKS and stress tests)
 test:
+	$(GOTEST) -short ./...
+
+## test-full: Run all tests including slow tests (LUKS, stress tests)
+test-full:
 	$(GOTEST) ./...
 
-## test-verbose: Run tests with verbose output
+## test-verbose: Run fast tests with verbose output
 test-verbose:
+	$(GOTEST) -short -v ./...
+
+## test-verbose-full: Run all tests with verbose output
+test-verbose-full:
 	$(GOTEST) -v ./...
 
-## test-race: Run tests with race detector
+## test-race: Run fast tests with race detector
 test-race:
+	$(GOTEST) -short -race ./...
+
+## test-race-full: Run all tests with race detector
+test-race-full:
 	$(GOTEST) -race ./...
 
-## test-cover: Run tests with coverage
+## test-cover: Run fast tests with coverage
 test-cover:
+	$(GOTEST) -short -coverprofile=$(COVERAGE_FILE) ./...
+	$(GOCMD) tool cover -func=$(COVERAGE_FILE)
+
+## test-cover-full: Run all tests with coverage
+test-cover-full:
 	$(GOTEST) -coverprofile=$(COVERAGE_FILE) ./...
 	$(GOCMD) tool cover -func=$(COVERAGE_FILE)
 
@@ -128,8 +145,8 @@ fuzz-full:
 	$(GOTEST) -fuzz=FuzzReadWrite -fuzztime=1h ./...
 	$(GOTEST) -fuzz=FuzzFullImage -fuzztime=1h ./...
 
-## test-all: Run all tests including QEMU interop (requires qemu-img)
-test-all: test test-race qemu-test
+## test-all: Run all tests including slow tests and QEMU interop (requires qemu-img)
+test-all: test-full test-race-full qemu-test
 
 ## install-tools: Install development tools
 install-tools:

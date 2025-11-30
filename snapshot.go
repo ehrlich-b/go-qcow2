@@ -122,12 +122,25 @@ func (img *Image) loadSnapshots() error {
 // Snapshots returns the list of snapshots in the image.
 // Returns nil if there are no snapshots.
 func (img *Image) Snapshots() []*Snapshot {
-	return img.snapshots
+	img.writeMu.Lock()
+	defer img.writeMu.Unlock()
+	// Return a copy to avoid races
+	result := make([]*Snapshot, len(img.snapshots))
+	copy(result, img.snapshots)
+	return result
 }
 
 // FindSnapshot finds a snapshot by ID or name.
 // Returns nil if not found.
 func (img *Image) FindSnapshot(idOrName string) *Snapshot {
+	img.writeMu.Lock()
+	defer img.writeMu.Unlock()
+	return img.findSnapshotLocked(idOrName)
+}
+
+// findSnapshotLocked finds a snapshot by ID or name without acquiring the lock.
+// Caller must hold img.writeMu.
+func (img *Image) findSnapshotLocked(idOrName string) *Snapshot {
 	for _, snap := range img.snapshots {
 		if snap.ID == idOrName || snap.Name == idOrName {
 			return snap
@@ -326,15 +339,19 @@ func (img *Image) CreateSnapshot(name string) (*Snapshot, error) {
 		return nil, fmt.Errorf("qcow2: snapshot name cannot be empty")
 	}
 
+	// Hold write lock for entire snapshot creation to prevent races
+	img.writeMu.Lock()
+	defer img.writeMu.Unlock()
+
 	// Check for duplicate name
-	if img.FindSnapshot(name) != nil {
+	if img.findSnapshotLocked(name) != nil {
 		return nil, fmt.Errorf("qcow2: snapshot with name %q already exists", name)
 	}
 
 	// Generate unique ID (QEMU uses sequential numbers as strings)
 	id := fmt.Sprintf("%d", len(img.snapshots)+1)
 	// Ensure ID is unique
-	for img.FindSnapshot(id) != nil {
+	for img.findSnapshotLocked(id) != nil {
 		id = fmt.Sprintf("%d", len(img.snapshots)+100)
 	}
 
@@ -589,6 +606,10 @@ func (img *Image) DeleteSnapshot(idOrName string) error {
 	if idOrName == "" {
 		return fmt.Errorf("qcow2: snapshot ID or name cannot be empty")
 	}
+
+	// Hold write lock for entire snapshot deletion to prevent races
+	img.writeMu.Lock()
+	defer img.writeMu.Unlock()
 
 	// Find the snapshot index
 	snapIndex := -1

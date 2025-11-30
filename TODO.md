@@ -1,6 +1,221 @@
 # TODO - go-qcow2 Roadmap
 
-See also [REVIEW_TODO.md](REVIEW_TODO.md) for review-driven fixes and checks.
+## Test Suite - Production Readiness
+
+Test gaps identified during code review. Prioritized by criticality for production deployment.
+
+### Current Coverage Summary
+
+| Category | Status | Notes |
+|----------|--------|-------|
+| Basic Read/Write | ✅ Good | `qcow2_test.go` |
+| QEMU Interop | ✅ Excellent | `qemu_interop_test.go` |
+| Regression Tests | ✅ Good | `regression_test.go` |
+| Fuzzing | ⚠️ Basic | `fuzz_test.go` - needs longer runs |
+| LUKS Encryption | ✅ Good | `luks_test.go` |
+| Bitmaps | ✅ Good | `bitmaps_test.go` |
+| Concurrency | ✅ Good | `regression_test.go`, `critical_test.go` |
+| Crash Recovery | ✅ Good | `critical_test.go` |
+| Corruption Handling | ✅ Good | `critical_test.go` |
+| Snapshots | ✅ Good | `snapshot_test.go` |
+| External Data Files | ✅ Good | `external_data_test.go` |
+| Stress Tests | ✅ Good | `stress_test.go` |
+
+### Test Phase 1: Critical (Before Any Production Use)
+
+#### 1.1 Crash Recovery / Power Failure Tests
+
+- [x] `TestCrashDuringClusterAllocation` - Kill process mid-allocation
+- [x] `TestCrashDuringL2TableWrite` - Partial L2 table on disk
+- [x] `TestCrashDuringL1TableUpdate` - L2 allocated but L1 not updated
+- [x] `TestCrashDuringRefcountUpdate` - Cluster allocated, refcount not incremented
+- [x] `TestCrashWithLazyRefcounts` - Verify lazy refcount recovery works
+- [x] `TestCrashDuringSnapshotCreation` - Partial snapshot state
+- [x] `TestRecoveryAfterDirtyBitSet` - Image marked dirty, verify repair
+- [x] `TestPartiallyWrittenCluster` - Crash mid-cluster write
+
+#### 1.2 Corrupted/Malformed Image Tests
+
+- [x] `TestCorruptedMagic` - Invalid magic number
+- [x] `TestCorruptedVersion` - Unknown version
+- [x] `TestCorruptedClusterBits` - Out of range (< 9 or > 21)
+- [x] `TestCorruptedL1TableOffset` - Points beyond EOF
+- [x] `TestCorruptedL1TableSize` - Impossibly large
+- [x] `TestCorruptedL2Entry` - Points beyond EOF
+- [x] `TestCorruptedL2EntryAlignment` - Non-512-byte aligned offset
+- [x] `TestCorruptedRefcountTableOffset` - Invalid offset
+- [x] `TestCorruptedRefcountBlock` - Block points to itself
+- [x] `TestCircularL1L2Reference` - L2 table points back to L1
+- [x] `TestOverlappingMetadata` - L1/L2/refcount tables overlap
+- [x] `TestOverlappingDataClusters` - Two L2 entries point to same cluster
+- [x] `TestInvalidCompressedDescriptor` - Bad compressed cluster size/offset
+- [x] `TestTruncatedImage` - File shorter than header indicates
+- [x] `TestZeroSizeImage` - Virtual size = 0
+- [x] `TestHugeVirtualSize` - Virtual size > physical possibility
+
+#### 1.3 Concurrent Snapshot Tests
+
+- [x] `TestSnapshotDuringConcurrentWrites` - Create snapshot while writes in progress
+- [x] `TestConcurrentSnapshotCreation` - Two goroutines create snapshots
+- [x] `TestWriteDuringSnapshotRead` - Write while reading from snapshot
+- [x] `TestDeleteSnapshotDuringRead` - Delete snapshot being read
+
+### Test Phase 2: Important (Before Wide Deployment)
+
+#### 2.1 Boundary Condition Tests
+
+- [x] `TestWriteAtExactClusterBoundary` - Write starts exactly at boundary
+- [x] `TestWriteEndsAtClusterBoundary` - Write ends exactly at boundary
+- [x] `TestWriteSpansThreeClusters` - Single write across 3 clusters
+- [x] `TestWriteSpansMultipleL2Tables` - Write crosses L2 table boundary
+- [x] `TestWriteAtLastByte` - Write to virtual_size - 1
+- [x] `TestWriteBeyondVirtualSize` - Should fail gracefully
+- [x] `TestReadAtLastByte` - Read last byte of image
+- [x] `TestZeroLengthWrite` - WriteAt with empty buffer
+- [x] `TestZeroLengthRead` - ReadAt with empty buffer
+- [x] `TestNegativeOffset` - Negative offset handling
+- [x] `TestMaxInt64Offset` - Very large offset
+
+#### 2.2 Refcount Bit Width Tests
+
+- [x] `TestRefcount1Bit` - Max 1 reference per cluster
+- [x] `TestRefcount2Bit` - Max 3 references
+- [x] `TestRefcount4Bit` - Max 15 references
+- [x] `TestRefcount8Bit` - Max 255 references
+- [x] `TestRefcount16Bit` - Default, max 65535
+- [x] `TestRefcount32Bit` - Max 4 billion
+- [x] `TestRefcount64Bit` - Max huge
+- [x] `TestRefcountOverflow` - Exceed max for each width
+- [x] `TestRefcountTableGrowth` - Allocate enough to need new refcount blocks
+
+#### 2.3 L1 Table Growth Tests
+
+- [x] `TestL1TableGrowsOnWrite` - Write beyond current L1 coverage
+- [x] `TestL1TableMaxSize` - Create image requiring large L1
+- [x] `TestL1TableReallocation` - L1 table needs to move
+
+#### 2.4 Backing Chain Tests
+
+- [x] `TestBackingChainDepth3` - Base -> overlay1 -> overlay2
+- [x] `TestBackingChainDepth10` - Deep chain
+- [x] `TestBackingChainDepthLimit` - Hit the 64-level limit
+- [x] `TestBackingChainDifferentClusterSizes` - Mixed 4K and 64K
+- [x] `TestBackingChainMixedVersions` - v2 base, v3 overlay
+- [x] `TestBackingChainWithCompressedBase` - Compressed clusters in base
+- [x] `TestBackingChainWithZeroFlaggedBase` - Zero-flagged in base
+- [x] `TestBackingChainCOWPartialCluster` - COW on partial cluster write
+- [x] `TestBackingChainMissingFile` - Base file deleted/moved
+- [x] `TestBackingChainCircularReference` - Image points to itself
+- [x] `TestBackingChainRelativePath` - Relative path resolution
+- [x] `TestBackingChainAbsolutePath` - Absolute path handling
+
+#### 2.5 Snapshot Edge Cases
+
+- [x] `TestCreateManySnapshots` - 100+ snapshots
+- [x] `TestSnapshotWithCompressedClusters` - Snapshot preserves compressed
+- [x] `TestSnapshotWithZeroFlaggedClusters` - Snapshot preserves zero flag
+- [x] `TestDeleteFirstSnapshot` - Delete oldest snapshot
+- [x] `TestDeleteLastSnapshot` - Delete newest snapshot
+- [x] `TestDeleteMiddleSnapshot` - Delete from middle
+- [x] `TestDeleteAllSnapshots` - Delete all, image still works
+- [x] `TestSnapshotNameMaxLength` - 65535 byte name
+- [x] `TestSnapshotNameUnicode` - UTF-8 characters in name
+- [x] `TestSnapshotNameEmpty` - Empty string name
+- [x] `TestSnapshotNameDuplicate` - Same name twice
+- [x] `TestRevertPreservesOtherSnapshots` - Revert doesn't delete snapshots
+- [x] `TestSnapshotL1SizeMismatch` - Snapshot with different L1 size
+
+#### 2.6 External Data File Tests
+
+- [x] `TestExternalDataFileBasic` - Create and use external data file
+- [x] `TestExternalDataFileTruncated` - Data file shorter than expected
+- [x] `TestExternalDataFileMissing` - Data file not found
+- [x] `TestExternalDataFilePermissionDenied` - Can't read data file
+- [x] `TestExternalDataFileGrowth` - Data file grows with writes
+- [x] `TestExternalDataFileWithCompression` - Should fail (incompatible)
+
+### Test Phase 3: Hardening
+
+#### 3.1 Stress / Longevity Tests
+
+- [x] `TestMillionClusters` - Image with 100K+ allocated clusters (4KB clusters)
+- [x] `TestLargeImage` - 2TB virtual size
+- [x] `TestRepeatedOpenClose` - Open/close 10000 times (leak check)
+- [x] `TestLongRunningWrites` - Continuous writes for 30 seconds
+- [x] `TestFragmentedAllocation` - Allocate, free, reallocate pattern
+- [x] `TestCacheEvictionStress` - Exceed cache size significantly
+- [x] `TestHighConcurrency` - 100 goroutines
+
+#### 3.2 Error Path Tests
+
+- [ ] `TestDiskFullDuringWrite` - ENOSPC handling
+- [ ] `TestDiskFullDuringAllocation` - Can't allocate new cluster
+- [ ] `TestReadOnlyFileSystem` - Write to RO mounted FS
+- [ ] `TestPermissionDenied` - File permission issues
+- [ ] `TestIOError` - Simulated I/O errors
+- [ ] `TestInterruptedSyscall` - EINTR handling
+
+#### 3.3 Encryption Edge Cases
+
+- [ ] `TestLUKS1AllCiphers` - aes-xts, aes-cbc, etc.
+- [ ] `TestLUKS2AllCiphers` - Modern cipher support
+- [ ] `TestLUKSKeySlots` - Multiple key slots
+- [ ] `TestLUKSCorruptedHeader` - Damaged LUKS header
+- [ ] `TestLUKSWrongKeySlot` - Password in slot 2, not slot 0
+- [ ] `TestAESLegacyReadCrossCluster` - Legacy AES across clusters
+- [ ] `TestEncryptedWithCompression` - Both enabled (should work)
+
+#### 3.4 Bitmap Edge Cases
+
+- [ ] `TestBitmapLargeImage` - Bitmap for TB+ image
+- [ ] `TestBitmapAllDirty` - Every bit set
+- [ ] `TestBitmapAllClean` - No bits set
+- [ ] `TestBitmapSparsePattern` - Alternating dirty/clean
+- [ ] `TestBitmapInvalidation` - Write clears auto-bitmap
+- [ ] `TestMultipleBitmaps` - 10+ bitmaps on one image
+- [ ] `TestBitmapNameCollision` - Duplicate bitmap names
+
+### Fuzzing Improvements
+
+#### Extended Fuzzing Campaigns
+
+- [ ] Run `FuzzParseHeader` for 24+ hours
+- [ ] Run `FuzzReadWrite` for 24+ hours
+- [ ] Run `FuzzFullImage` for 24+ hours
+- [ ] Add coverage-guided corpus from real QEMU images
+
+#### New Fuzz Targets
+
+- [ ] `FuzzL2TableParsing` - Malformed L2 tables
+- [ ] `FuzzRefcountBlock` - Malformed refcount blocks
+- [ ] `FuzzCompressedCluster` - Invalid compressed data
+- [ ] `FuzzSnapshotHeader` - Malformed snapshot headers
+- [ ] `FuzzBitmapDirectory` - Malformed bitmap metadata
+- [ ] `FuzzExtensions` - Unknown/malformed extensions
+- [ ] `FuzzCheck` - Run Check() on corrupted images
+- [ ] `FuzzRepair` - Run Repair() on corrupted images
+
+### Test Infrastructure Improvements
+
+- [ ] `createCorruptedImage()` helper - Generate image with specific corruption
+- [ ] `createPartialWriteImage()` helper - Simulate crash mid-operation
+- [ ] `mockIOErrors()` helper - Inject I/O errors at specific offsets
+- [ ] Add nightly fuzzing job (24h runs)
+- [ ] Add weekly stress test job
+- [ ] Add coverage tracking and minimum threshold
+- [ ] Test on multiple QEMU versions (4.0, 5.0, 6.0, 7.0, 8.0)
+
+### Production Readiness Acceptance Criteria
+
+1. **All Phase 1 tests pass** - Crash recovery and corruption handling
+2. **All Phase 2 tests pass** - Boundary conditions and edge cases
+3. **24-hour fuzz test** - No crashes found
+4. **24-hour stress test** - No leaks, corruption, or errors
+5. **Race detector clean** - `go test -race` finds no issues
+6. **QEMU interop 100%** - All QEMU versions pass check
+7. **Code coverage > 80%** - Measured by `go test -cover`
+
+---
 
 ## Phase 1: Core Functionality ✅ COMPLETE
 
@@ -197,28 +412,6 @@ See also [REVIEW_TODO.md](REVIEW_TODO.md) for review-driven fixes and checks.
 - [ ] Request queue handling
 - [ ] Create ublk target backend
 - [ ] Performance testing vs qemu-nbd
-
----
-
-## Testing
-
-### E2E / QEMU Interop ✅
-- [x] Create images with `qemu-img` (various cluster sizes, versions)
-- [x] Write patterns with `qemu-io`
-- [x] Read QEMU images, verify checksums
-- [x] Write with our lib, verify with `qemu-img check`
-- [x] Round-trip: QEMU -> us -> QEMU
-
-### Fuzz Testing ✅
-- [x] Fuzz header parsing
-- [x] Fuzz L2 table entries
-- [x] Fuzz random offset read/write
-- [x] Fuzz refcount entry read/write
-- [x] Fuzz full image opening
-
-### Test Infrastructure
-- [x] Add GitHub Actions CI workflow
-- [x] Add benchmarks
 
 ---
 

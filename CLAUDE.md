@@ -13,13 +13,20 @@ A pure Go implementation of the QCOW2 (QEMU Copy-On-Write version 2) disk image 
 Always use `make` commands when available:
 ```bash
 make build            # Build the library
-make test             # Run tests
-make test-race        # Run tests with race detector
-make test-cover       # Run tests with coverage
+make test             # Run fast tests (< 10 seconds, skips LUKS/stress tests)
+make test-full        # Run all tests including slow tests
+make test-race        # Run fast tests with race detector
+make test-race-full   # Run all tests with race detector
+make test-cover       # Run fast tests with coverage
 make check            # Run all checks (fmt, vet, build, test)
 make fmt              # Format code
 make help             # Show all available targets
 ```
+
+### Test Organization
+- **Fast tests** (`make test`): Uses `-short` flag, skips LUKS (slow key derivation) and stress tests. Runs in ~5-10 seconds. QEMU tests run but skip gracefully if qemu-img not available.
+- **Full tests** (`make test-full`): Runs ALL tests including LUKS encryption and stress tests. May take 30+ seconds.
+- **QEMU interop** (`make qemu-test`): Explicitly requires qemu-img, fails if not available.
 
 ## Architecture Decisions
 

@@ -389,6 +389,13 @@ func (img *Image) WriteAtCompressed(data []byte, off int64) (int, error) {
 		return 0, fmt.Errorf("qcow2: writing to extended L2 images (subcluster allocation) is not yet supported")
 	}
 
+	// Compression is incompatible with external data files
+	// Compressed clusters have a special L2 entry format that encodes offset+size,
+	// which conflicts with the raw sector layout expected by external data files
+	if img.externalDataFile != nil {
+		return 0, fmt.Errorf("qcow2: compressed writes are not supported with external data files")
+	}
+
 	if off < 0 {
 		return 0, ErrOffsetOutOfRange
 	}

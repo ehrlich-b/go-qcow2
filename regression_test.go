@@ -561,6 +561,9 @@ func TestMetadataAllocationInMainFile(t *testing.T) {
 // TestRefcountAfterManyAllocations stress tests the refcount block allocation
 // to ensure refcounts are consistent after many cluster allocations.
 func TestRefcountAfterManyAllocations(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping stress test in short mode")
+	}
 	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.qcow2")
@@ -765,6 +768,9 @@ func TestL2EntryFlagsIntegrity(t *testing.T) {
 // TestConcurrencyStress tests concurrent writes from multiple goroutines to
 // overlapping regions and verifies Check() reports no leaks or corruptions.
 func TestConcurrencyStress(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping stress test in short mode")
+	}
 	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "concurrent.qcow2")
@@ -858,6 +864,9 @@ func TestConcurrencyStress(t *testing.T) {
 // TestConcurrencyMixedOperations tests concurrent mixed operations (read/write/zero)
 // from multiple goroutines.
 func TestConcurrencyMixedOperations(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping stress test in short mode")
+	}
 	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "mixed.qcow2")

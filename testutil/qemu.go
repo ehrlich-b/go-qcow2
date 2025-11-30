@@ -372,6 +372,33 @@ func FileSize(t *testing.T, path string) int64 {
 	return info.Size()
 }
 
+// QemuCreateOverlay creates a QCOW2 overlay image with backing file.
+func QemuCreateOverlay(t *testing.T, path, backingPath string, opts ...string) {
+	t.Helper()
+	RequireQemu(t)
+
+	args := []string{"create", "-f", "qcow2", "-b", backingPath, "-F", "qcow2"}
+	args = append(args, opts...)
+	args = append(args, path)
+
+	result := RunQemuImg(t, args...)
+	if result.ExitCode != 0 {
+		t.Fatalf("qemu-img create overlay failed: %s", result.Stderr)
+	}
+}
+
+// QemuZero writes zeros (with zero-flag) to an image using qemu-io.
+func QemuZero(t *testing.T, path string, offset, length int64) {
+	t.Helper()
+	RequireQemuIO(t)
+
+	cmd := fmt.Sprintf("write -z %d %d", offset, length)
+	result := RunQemuIO(t, "-c", cmd, path)
+	if result.ExitCode != 0 {
+		t.Fatalf("qemu-io write -z failed: %s", result.Stderr)
+	}
+}
+
 // QemuSnapshot creates a snapshot in the image.
 func QemuSnapshot(t *testing.T, path string, name string) {
 	t.Helper()

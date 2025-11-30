@@ -72,19 +72,25 @@ func Create(path string, opts CreateOptions) (*Image, error) {
 
 	// Layout the image:
 	// Cluster 0: Header
-	// Cluster 1: L1 table
-	// Cluster 2: Refcount table
-	// Cluster 3: First refcount block
-	// Cluster 4+: Data clusters
+	// Cluster 1+: L1 table (may span multiple clusters)
+	// Next cluster: Refcount table
+	// Next cluster: First refcount block
+	// Remaining: Data clusters
 
 	headerLength := uint32(HeaderSizeV3)
 	if opts.Version == Version2 {
 		headerLength = HeaderSizeV2
 	}
 
-	l1TableOffset := clusterSize                // Cluster 1
-	refcountTableOffset := clusterSize * 2      // Cluster 2
-	firstRefcountBlockOffset := clusterSize * 3 // Cluster 3
+	// Calculate how many clusters the L1 table needs
+	l1Clusters := (l1TableBytes + clusterSize - 1) / clusterSize
+	if l1Clusters == 0 {
+		l1Clusters = 1
+	}
+
+	l1TableOffset := clusterSize                                  // Starts at cluster 1
+	refcountTableOffset := clusterSize + l1Clusters*clusterSize   // After L1 table
+	firstRefcountBlockOffset := refcountTableOffset + clusterSize // After refcount table
 
 	// Calculate refcount table size
 	// With 16-bit refcounts and 64KB clusters, one refcount block covers:
@@ -215,13 +221,22 @@ func Create(path string, opts CreateOptions) (*Image, error) {
 	}
 
 	// Write first refcount block
-	// Mark clusters 0-3 as used (refcount = 1)
+	// Mark all initial clusters as used (refcount = 1)
+	// Cluster 0: header
+	// Clusters 1 to l1Clusters: L1 table
+	// Next cluster: refcount table
+	// Next cluster: refcount block
 	refcountBlock := make([]byte, clusterSize)
-	// 16-bit refcounts, big-endian
-	binary.BigEndian.PutUint16(refcountBlock[0:2], 1) // Cluster 0: header
-	binary.BigEndian.PutUint16(refcountBlock[2:4], 1) // Cluster 1: L1 table
-	binary.BigEndian.PutUint16(refcountBlock[4:6], 1) // Cluster 2: refcount table
-	binary.BigEndian.PutUint16(refcountBlock[6:8], 1) // Cluster 3: refcount block
+
+	// Calculate total initial clusters
+	// 1 (header) + l1Clusters (L1 table) + 1 (refcount table) + 1 (refcount block)
+	initialClusters := 1 + l1Clusters + 2
+
+	// Mark each initial cluster with refcount = 1
+	for i := uint64(0); i < initialClusters; i++ {
+		binary.BigEndian.PutUint16(refcountBlock[i*2:(i+1)*2], 1)
+	}
+
 	if _, err := f.WriteAt(refcountBlock, int64(firstRefcountBlockOffset)); err != nil {
 		f.Close()
 		os.Remove(path)
@@ -229,7 +244,7 @@ func Create(path string, opts CreateOptions) (*Image, error) {
 	}
 
 	// Extend file to include all initial clusters
-	initialSize := clusterSize * 4 // Header + L1 + RefcountTable + RefcountBlock
+	initialSize := initialClusters * clusterSize
 	if err := f.Truncate(int64(initialSize)); err != nil {
 		f.Close()
 		os.Remove(path)
