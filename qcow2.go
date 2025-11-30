@@ -201,17 +201,17 @@ func (img *Image) GetCompressionType() uint8 {
 }
 
 // Open opens an existing QCOW2 image file.
-func Open(path string) (*Image, error) {
-	return OpenFile(path, os.O_RDWR, 0)
+func Open(path string, opts ...Option) (*Image, error) {
+	return OpenFile(path, os.O_RDWR, 0, opts...)
 }
 
 // OpenFile opens a QCOW2 image with specific flags.
-func OpenFile(path string, flag int, perm os.FileMode) (*Image, error) {
-	return openFileWithDepth(path, flag, perm, 0)
+func OpenFile(path string, flag int, perm os.FileMode, opts ...Option) (*Image, error) {
+	return openFileWithDepth(path, flag, perm, 0, opts...)
 }
 
 // openFileWithDepth opens a QCOW2 image tracking backing chain depth.
-func openFileWithDepth(path string, flag int, perm os.FileMode, depth int) (*Image, error) {
+func openFileWithDepth(path string, flag int, perm os.FileMode, depth int, opts ...Option) (*Image, error) {
 	if depth > MaxBackingChainDepth {
 		return nil, ErrBackingChainTooDeep
 	}
@@ -221,7 +221,7 @@ func openFileWithDepth(path string, flag int, perm os.FileMode, depth int) (*Ima
 		return nil, fmt.Errorf("qcow2: failed to open file: %w", err)
 	}
 
-	img, err := newImage(f, flag&os.O_RDWR == 0 || flag == os.O_RDONLY, depth)
+	img, err := newImage(f, flag&os.O_RDWR == 0 || flag == os.O_RDONLY, depth, opts...)
 	if err != nil {
 		f.Close()
 		return nil, err
@@ -231,7 +231,13 @@ func openFileWithDepth(path string, flag int, perm os.FileMode, depth int) (*Ima
 }
 
 // newImage creates an Image from an already-open file.
-func newImage(f *os.File, readOnly bool, chainDepth int) (*Image, error) {
+func newImage(f *os.File, readOnly bool, chainDepth int, opts ...Option) (*Image, error) {
+	// Apply options
+	imgOpts := defaultImageOptions()
+	for _, opt := range opts {
+		opt(imgOpts)
+	}
+
 	// Read header (include extra byte for compression type at offset 104)
 	headerBuf := make([]byte, HeaderSizeV3+1)
 	n, err := f.ReadAt(headerBuf, 0)
@@ -285,14 +291,14 @@ func newImage(f *os.File, readOnly bool, chainDepth int) (*Image, error) {
 		return nil, fmt.Errorf("qcow2: failed to load L1 table: %w", err)
 	}
 
-	// Initialize L2 cache (default 32 entries = 2MB with 64KB clusters)
-	img.l2Cache = newL2Cache(32, int(img.clusterSize))
+	// Initialize L2 cache
+	img.l2Cache = newL2Cache(imgOpts.l2CacheSize, int(img.clusterSize))
 
-	// Initialize compressed cluster cache (default 16 entries)
-	img.compressedCache = newCompressedClusterCache(16, int(img.clusterSize))
+	// Initialize compressed cluster cache
+	img.compressedCache = newCompressedClusterCache(imgOpts.compressedCacheSize, int(img.clusterSize))
 
-	// Initialize refcount block cache (default 16 entries)
-	img.refcountBlockCache = newL2Cache(16, int(img.clusterSize))
+	// Initialize refcount block cache
+	img.refcountBlockCache = newL2Cache(imgOpts.refcountCacheSize, int(img.clusterSize))
 
 	// Initialize cluster buffer pool
 	clusterSize := img.clusterSize
@@ -1416,6 +1422,24 @@ func (img *Image) Header() Header {
 // A dirty image was not cleanly closed and may need repair.
 func (img *Image) IsDirty() bool {
 	return img.header.IsDirty()
+}
+
+// L2CacheStats returns statistics about the L2 table cache.
+// Use this to monitor cache efficiency and tune cache sizes.
+func (img *Image) L2CacheStats() CacheStats {
+	return img.l2Cache.stats()
+}
+
+// RefcountCacheStats returns statistics about the refcount block cache.
+func (img *Image) RefcountCacheStats() CacheStats {
+	return img.refcountBlockCache.stats()
+}
+
+// ResetCacheStats resets all cache statistics counters to zero.
+// Useful for measuring cache performance over a specific workload.
+func (img *Image) ResetCacheStats() {
+	img.l2Cache.resetStats()
+	img.refcountBlockCache.resetStats()
 }
 
 // WriteZeroAt writes zeros efficiently using the zero cluster flag.

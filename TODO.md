@@ -177,10 +177,10 @@
 - [x] Batch fsync operations - BarrierBatched mode defers syncs until Flush()
 - [x] Free cluster bitmap - O(1) allocation using bitmap with lazy build
 
-### P2 - Medium Priority
-- [ ] Lock sharding for L2 cache
-- [ ] Configurable cache sizes
-- [ ] Cache statistics/metrics
+### P2 - Medium Priority ✅
+- [x] Lock sharding for L2 cache
+- [x] Configurable cache sizes
+- [x] Cache statistics/metrics
 
 ### I/O Optimization (Future)
 - [ ] io_uring backend interface
@@ -224,7 +224,7 @@
 
 ### Design Decisions
 1. **Zero-struct L2 tables**: Keep as `[]byte`, access via `binary.BigEndian.Uint64`
-2. **LRU cache**: Simple doubly-linked list, returns direct references (no copy on hit)
+2. **Sharded LRU cache**: 8-shard cache reduces lock contention under concurrent access; per-shard LRU with direct references (no copy on hit)
 3. **Cluster allocation**: File-end growth with free cluster reuse via refcount scanning
 4. **BackingStore interface**: Supports both qcow2 and raw backing files
 5. **Lazy refcounts**: Skip refcount updates during writes, rebuild from L1/L2 on dirty open

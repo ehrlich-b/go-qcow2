@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/ehrlich-b/go-qcow2/testutil"
@@ -320,7 +321,8 @@ func TestInvalidMagic(t *testing.T) {
 
 func TestL2Cache(t *testing.T) {
 	t.Parallel()
-	cache := newL2Cache(3, 64) // Small cache for testing
+	// Use single shard for deterministic LRU testing
+	cache := newL2CacheWithShards(3, 1) // Small cache for testing
 
 	// Add entries
 	data1 := make([]byte, 64)
@@ -374,6 +376,186 @@ func TestL2Cache(t *testing.T) {
 	if got := cache.get(4000); len(got) == 0 || got[0] != 4 {
 		t.Error("cache.get(4000) should still be present")
 	}
+}
+
+func TestL2CacheSharding(t *testing.T) {
+	t.Parallel()
+	// Use sharded cache (default 8 shards)
+	cache := newL2Cache(32, 64)
+
+	// Add entries that will hash to different shards
+	// Offsets chosen to hit different shards based on the hash function
+	offsets := []uint64{
+		0x10000, // shard 0
+		0x10001, // shard 1
+		0x10002, // shard 2
+		0x10003, // shard 3
+		0x10004, // shard 4
+		0x10005, // shard 5
+		0x10006, // shard 6
+		0x10007, // shard 7
+	}
+
+	// Add entries
+	for i, off := range offsets {
+		data := make([]byte, 64)
+		data[0] = byte(i)
+		cache.put(off, data)
+	}
+
+	// Verify all entries are present
+	for i, off := range offsets {
+		got := cache.get(off)
+		if len(got) == 0 {
+			t.Errorf("cache.get(0x%x) returned empty", off)
+			continue
+		}
+		if got[0] != byte(i) {
+			t.Errorf("cache.get(0x%x) = %d, want %d", off, got[0], i)
+		}
+	}
+
+	if cache.size() != 8 {
+		t.Errorf("cache.size() = %d, want 8", cache.size())
+	}
+
+	// Clear and verify
+	cache.clear()
+	if cache.size() != 0 {
+		t.Errorf("after clear, cache.size() = %d, want 0", cache.size())
+	}
+}
+
+func TestL2CacheConcurrent(t *testing.T) {
+	t.Parallel()
+	cache := newL2Cache(64, 64) // 8 entries per shard with 8 shards
+
+	const numGoroutines = 16
+	const opsPerGoroutine = 100
+
+	var wg sync.WaitGroup
+	wg.Add(numGoroutines)
+
+	for g := 0; g < numGoroutines; g++ {
+		go func(id int) {
+			defer wg.Done()
+			for i := 0; i < opsPerGoroutine; i++ {
+				offset := uint64(id*1000 + i)
+				data := make([]byte, 64)
+				data[0] = byte(id)
+				data[1] = byte(i)
+
+				cache.put(offset, data)
+				got := cache.get(offset)
+				if got == nil {
+					// May have been evicted, that's OK
+					continue
+				}
+				if got[0] != byte(id) || got[1] != byte(i) {
+					t.Errorf("data mismatch for offset %d", offset)
+				}
+			}
+		}(g)
+	}
+
+	wg.Wait()
+}
+
+func TestOpenWithOptions(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.qcow2")
+
+	// Create a test image
+	img, err := CreateSimple(path, 1024*1024)
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+	img.Close()
+
+	// Open with custom cache sizes
+	img, err = Open(path,
+		WithL2CacheSize(64),
+		WithCompressedCacheSize(32),
+		WithRefcountCacheSize(24),
+	)
+	if err != nil {
+		t.Fatalf("Open with options failed: %v", err)
+	}
+	defer img.Close()
+
+	// Verify image works correctly
+	testData := []byte("hello world")
+	if _, err := img.WriteAt(testData, 0); err != nil {
+		t.Fatalf("WriteAt failed: %v", err)
+	}
+
+	buf := make([]byte, len(testData))
+	if _, err := img.ReadAt(buf, 0); err != nil {
+		t.Fatalf("ReadAt failed: %v", err)
+	}
+
+	if !bytes.Equal(buf, testData) {
+		t.Errorf("ReadAt = %q, want %q", buf, testData)
+	}
+}
+
+func TestCacheStats(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.qcow2")
+
+	// Create a larger image for multiple clusters
+	img, err := CreateSimple(path, 10*1024*1024) // 10MB
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+
+	// Reset stats to start fresh
+	img.ResetCacheStats()
+
+	// Initial stats should be zero
+	stats := img.L2CacheStats()
+	if stats.Hits != 0 || stats.Misses != 0 {
+		t.Errorf("Initial stats should be zero, got hits=%d misses=%d", stats.Hits, stats.Misses)
+	}
+
+	// Write to multiple locations to generate cache activity
+	data := make([]byte, 1024)
+	for i := 0; i < 5; i++ {
+		offset := int64(i) * int64(img.ClusterSize()) * 2
+		if _, err := img.WriteAt(data, offset); err != nil {
+			t.Fatalf("WriteAt failed: %v", err)
+		}
+	}
+
+	// Read back from same locations (should be cache hits)
+	for i := 0; i < 5; i++ {
+		offset := int64(i) * int64(img.ClusterSize()) * 2
+		if _, err := img.ReadAt(data, offset); err != nil {
+			t.Fatalf("ReadAt failed: %v", err)
+		}
+	}
+
+	// Check that we have some cache activity
+	stats = img.L2CacheStats()
+	if stats.Hits+stats.Misses == 0 {
+		t.Error("Expected some cache activity")
+	}
+
+	// Hit rate should be reasonable (we're reading what we just wrote)
+	if stats.Hits == 0 {
+		t.Error("Expected at least some cache hits")
+	}
+
+	// Test reset
+	img.ResetCacheStats()
+	stats = img.L2CacheStats()
+	if stats.Hits != 0 || stats.Misses != 0 {
+		t.Errorf("After reset, stats should be zero, got hits=%d misses=%d", stats.Hits, stats.Misses)
+	}
+
+	img.Close()
 }
 
 func TestDirtyBitTracking(t *testing.T) {
