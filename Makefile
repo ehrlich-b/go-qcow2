@@ -1,4 +1,4 @@
-.PHONY: all build test test-verbose test-race test-cover bench lint fmt vet clean check help qemu-test fuzz fuzz-quick fuzz-medium fuzz-full test-all profile-cpu profile-mem profile-all profile-trace profile-block
+.PHONY: all build test test-verbose test-race test-cover bench lint fmt vet clean check help qemu-test fuzz fuzz-quick fuzz-medium fuzz-full test-all profile-cpu profile-mem profile-all profile-trace profile-block docker-build docker-test docker-test-verbose docker-check docker-bench docker-qemu-img
 
 # Go parameters
 GOCMD=go
@@ -179,3 +179,38 @@ help:
 	@echo ""
 	@echo "Targets:"
 	@sed -n 's/^## //p' $(MAKEFILE_LIST) | column -t -s ':'
+
+# ============================================================================
+# Docker targets (QEMU 8.2+ with bitmap and LUKS2 support)
+# ============================================================================
+
+DOCKER_IMAGE=go-qcow2
+DOCKER_RUN=docker run --rm -v $(PWD):/work -w /work $(DOCKER_IMAGE)
+
+## docker-build: Build the Docker image with QEMU 8.2+
+docker-build:
+	docker build -t $(DOCKER_IMAGE) .
+
+## docker-test: Run tests in Docker (QEMU 8.2+ for bitmap/LUKS2)
+docker-test: docker-build
+	$(DOCKER_RUN) go test ./...
+
+## docker-test-verbose: Run tests in Docker with verbose output
+docker-test-verbose: docker-build
+	$(DOCKER_RUN) go test -v ./...
+
+## docker-test-race: Run tests in Docker with race detector
+docker-test-race: docker-build
+	$(DOCKER_RUN) go test -race ./...
+
+## docker-check: Run all checks in Docker
+docker-check: docker-build
+	$(DOCKER_RUN) sh -c "go vet ./... && go build -v ./... && go test ./..."
+
+## docker-bench: Run benchmarks in Docker
+docker-bench: docker-build
+	$(DOCKER_RUN) go test -bench=. -benchmem ./...
+
+## docker-qemu-img: Run qemu-img 8.2 in Docker (usage: make docker-qemu-img ARGS="info disk.qcow2")
+docker-qemu-img: docker-build
+	$(DOCKER_RUN) qemu-img $(ARGS)

@@ -2446,9 +2446,10 @@ func TestExtendedL2Entries(t *testing.T) {
 
 	// Write test pattern using qemu-io at various subcluster offsets
 	subclusterSize := 64 * 1024 / 32 // 2KB subclusters for 64KB clusters
-	result = testutil.RunQemuIO(t, imgPath,
-		fmt.Sprintf("write -P 0xAA 0 %d", subclusterSize),                    // Subcluster 0
-		fmt.Sprintf("write -P 0xBB %d %d", subclusterSize*5, subclusterSize), // Subcluster 5
+	result = testutil.RunQemuIO(t,
+		"-c", fmt.Sprintf("write -P 0xAA 0 %d", subclusterSize), // Subcluster 0
+		"-c", fmt.Sprintf("write -P 0xBB %d %d", subclusterSize*5, subclusterSize), // Subcluster 5
+		imgPath,
 	)
 	if result.ExitCode != 0 {
 		t.Fatalf("qemu-io write failed: %s", result.Stderr)

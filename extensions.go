@@ -113,6 +113,14 @@ func (img *Image) parseHeaderExtensions() (*HeaderExtensions, error) {
 				}
 			}
 
+		case ExtensionBitmaps:
+			// Parse bitmap extension and store directly on Image
+			bitmapExt, err := parseBitmapExtension(data)
+			if err != nil {
+				return nil, fmt.Errorf("qcow2: failed to parse bitmap extension: %w", err)
+			}
+			img.bitmapExt = bitmapExt
+
 		default:
 			// Store unknown extensions
 			ext := HeaderExtension{

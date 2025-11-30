@@ -94,6 +94,9 @@ type Image struct {
 	subclusterSize uint64 // Cluster size / 32 (only used for extended L2)
 	subclusters    uint32 // Number of subclusters per cluster (32 for extended L2, 1 otherwise)
 
+	// Bitmap extension data (for dirty tracking bitmaps)
+	bitmapExt *bitmapExtension
+
 	// Buffer pool for cluster-sized allocations
 	clusterPool sync.Pool
 }

@@ -93,7 +93,7 @@
 
 ---
 
-## Phase 4: Advanced Features
+## Phase 4: Advanced Features ✅ COMPLETE
 
 ### Compression - Writing
 - [x] Compress clusters on write (optional)
@@ -147,9 +147,14 @@
 - [x] Parse 128-bit extended L2 entries
 - [x] 32 subclusters per cluster (read-only, test skipped if qemu < 5.2)
 
-### Bitmaps / Dirty Tracking
-- [ ] Bitmap directory parsing
-- [ ] Dirty tracking for incremental backups
+### Bitmaps / Dirty Tracking ✅
+- [x] Bitmap extension parsing (0x23852875)
+- [x] Bitmap directory entry parsing
+- [x] Bitmap table reading with all-zeros/all-ones optimization
+- [x] Dirty tracking bitmap API (Bitmaps, FindBitmap, OpenBitmap)
+- [x] IsSet() for single-bit queries
+- [x] GetDirtyRanges() for incremental backup enumeration
+- [x] CountDirtyBits/CountDirtyBytes statistics
 
 ### External Data Files ✅
 - [x] External data file name extension (0x44415441)

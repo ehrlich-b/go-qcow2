@@ -141,29 +141,35 @@ Bit 62 (Z): Compressed (L2 only) / Reserved (L1)
 
 ## Current Status
 
-**Status: Experimental / Untested**
+**Status: Feature Complete (Beta)**
 
-The basic structure is in place but has not been validated against real QCOW2 images or tested
-for correctness with `qemu-img check`.
+Comprehensive QCOW2 support with extensive testing against qemu-img.
 
-### Implemented (Untested)
+### Core Features
 - [x] Header parsing and validation (v2 and v3)
 - [x] L1/L2 table address translation
-- [x] `io.ReaderAt` interface
-- [x] `io.WriterAt` interface
+- [x] `io.ReaderAt` and `io.WriterAt` interfaces
 - [x] LRU cache for L2 tables
-- [x] Basic cluster allocation
+- [x] Cluster allocation with free-space tracking
 - [x] Image creation (`Create()`)
 
+### Advanced Features
+- [x] Backing file support (COW chains, raw + qcow2)
+- [x] Refcount table management (variable width: 1-64 bits)
+- [x] Lazy refcounts with automatic rebuild
+- [x] Compression (deflate + zstd)
+- [x] Encryption (legacy AES read-only, LUKS1/LUKS2 read/write)
+- [x] Snapshots (create, delete, revert, read)
+- [x] Extended L2 entries (32 subclusters)
+- [x] External data files
+- [x] Dirty tracking bitmaps (incremental backup support)
+- [x] Zero clusters (space-efficient zeroing)
+- [x] Write ordering barriers (configurable safety levels)
+
 ### Not Yet Implemented
-- [ ] Backing file support (COW chains)
-- [ ] Refcount table management
-- [ ] Lazy refcounts
-- [ ] Compression (zlib, zstd)
-- [ ] Encryption (AES, LUKS)
-- [ ] Snapshots
-- [ ] Extended L2 entries
 - [ ] io_uring backend
+- [ ] Direct I/O (O_DIRECT)
+- [ ] go-ublk integration
 
 ## QCOW2 Header Fields
 
