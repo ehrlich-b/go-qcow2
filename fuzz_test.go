@@ -111,13 +111,13 @@ func FuzzParseHeader(f *testing.F) {
 // FuzzL2Entry fuzzes L2 entry interpretation.
 func FuzzL2Entry(f *testing.F) {
 	// Seed with known L2 entry patterns
-	f.Add(uint64(0))                               // Unallocated
-	f.Add(uint64(L2EntryZeroFlag))                 // Zero cluster
-	f.Add(uint64(0x50000 | L2EntryCopied))         // Normal allocated
-	f.Add(uint64(L2EntryCompressed | 0x1000))      // Compressed
-	f.Add(uint64(0xFFFFFFFFFFFFFFFF))              // All bits set
-	f.Add(uint64(L2EntryOffsetMask))               // Max offset
-	f.Add(uint64(L2EntryCopied | L2EntryZeroFlag)) // Copied + zero
+	f.Add(uint64(0))                          // Unallocated
+	f.Add(L2EntryZeroFlag)                    // Zero cluster
+	f.Add(0x50000 | L2EntryCopied)            // Normal allocated
+	f.Add(L2EntryCompressed | 0x1000)         // Compressed
+	f.Add(uint64(0xFFFFFFFFFFFFFFFF))         // All bits set
+	f.Add(L2EntryOffsetMask)                  // Max offset
+	f.Add(L2EntryCopied | L2EntryZeroFlag)    // Copied + zero
 
 	f.Fuzz(func(t *testing.T, entry uint64) {
 		// Parse entry components - should not panic

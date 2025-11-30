@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/ehrlich-b/go-qcow2/testutil"
 )
 
 func TestCreateAndOpen(t *testing.T) {
@@ -90,7 +92,7 @@ func TestReadWriteRoundtrip(t *testing.T) {
 	defer img2.Close()
 
 	buf2 := make([]byte, len(data))
-	n, err = img2.ReadAt(buf2, 0)
+	_, err = img2.ReadAt(buf2, 0)
 	if err != nil {
 		t.Fatalf("ReadAt after reopen failed: %v", err)
 	}
@@ -199,7 +201,7 @@ func TestCrossClusterWrite(t *testing.T) {
 
 	// Read it back
 	buf := make([]byte, len(data))
-	n, err = img.ReadAt(buf, offset)
+	_, err = img.ReadAt(buf, offset)
 	if err != nil {
 		t.Fatalf("ReadAt failed: %v", err)
 	}
@@ -335,15 +337,15 @@ func TestL2Cache(t *testing.T) {
 
 	// Access order: 1000, 2000, 3000 (3000 is MRU)
 	// Verify all present
-	if got := cache.get(1000); got == nil || got[0] != 1 {
+	if got := cache.get(1000); len(got) == 0 || got[0] != 1 {
 		t.Error("cache.get(1000) failed")
 	}
 	// After accessing 1000, order is: 2000, 3000, 1000 (1000 is MRU)
-	if got := cache.get(2000); got == nil || got[0] != 2 {
+	if got := cache.get(2000); len(got) == 0 || got[0] != 2 {
 		t.Error("cache.get(2000) failed")
 	}
 	// After accessing 2000, order is: 3000, 1000, 2000 (2000 is MRU)
-	if got := cache.get(3000); got == nil || got[0] != 3 {
+	if got := cache.get(3000); len(got) == 0 || got[0] != 3 {
 		t.Error("cache.get(3000) failed")
 	}
 	// After accessing 3000, order is: 1000, 2000, 3000 (3000 is MRU, 1000 is LRU)
@@ -363,13 +365,13 @@ func TestL2Cache(t *testing.T) {
 	}
 
 	// 2000, 3000, 4000 should still be present
-	if got := cache.get(2000); got == nil || got[0] != 2 {
+	if got := cache.get(2000); len(got) == 0 || got[0] != 2 {
 		t.Error("cache.get(2000) should still be present")
 	}
-	if got := cache.get(3000); got == nil || got[0] != 3 {
+	if got := cache.get(3000); len(got) == 0 || got[0] != 3 {
 		t.Error("cache.get(3000) should still be present")
 	}
-	if got := cache.get(4000); got == nil || got[0] != 4 {
+	if got := cache.get(4000); len(got) == 0 || got[0] != 4 {
 		t.Error("cache.get(4000) should still be present")
 	}
 }
@@ -732,10 +734,7 @@ func TestHeaderExtensionsParsing(t *testing.T) {
 	entry[1] = 0                 // bit 0
 	copy(entry[2:], "dirty bit") // name
 
-	err := parseFeatureNameTable(entry, names)
-	if err != nil {
-		t.Fatalf("parseFeatureNameTable failed: %v", err)
-	}
+	parseFeatureNameTable(entry, names)
 
 	if names["incompat_0"] != "dirty bit" {
 		t.Errorf("Feature name = %q, want %q", names["incompat_0"], "dirty bit")
@@ -1210,7 +1209,7 @@ func TestRawBackingFile(t *testing.T) {
 	if _, err := overlay.ReadAt(readBuf3, 1000); err != nil {
 		t.Fatalf("ReadAt after write failed: %v", err)
 	}
-	if string(readBuf3) != string(cowData) {
+	if !bytes.Equal(readBuf3, cowData) {
 		t.Errorf("COW data = %q, want %q", readBuf3, cowData)
 	}
 
@@ -1232,7 +1231,7 @@ func TestRawBackingFile(t *testing.T) {
 	if _, err := overlay2.ReadAt(readBuf3, 1000); err != nil {
 		t.Fatalf("ReadAt after reopen failed: %v", err)
 	}
-	if string(readBuf3) != string(cowData) {
+	if !bytes.Equal(readBuf3, cowData) {
 		t.Errorf("After reopen: COW data = %q, want %q", readBuf3, cowData)
 	}
 
@@ -1955,8 +1954,6 @@ func TestBackingChainDepthLimit(t *testing.T) {
 
 	// Create chain of overlays
 	prevPath := basePath
-	var paths []string
-	paths = append(paths, basePath)
 
 	for i := 1; i < chainLength; i++ {
 		overlayPath := filepath.Join(dir, fmt.Sprintf("overlay%d.qcow2", i))
@@ -1968,7 +1965,6 @@ func TestBackingChainDepthLimit(t *testing.T) {
 				t.Fatalf("CreateOverlay %d failed unexpectedly: %v", i, err)
 			}
 			overlay.Close()
-			paths = append(paths, overlayPath)
 			prevPath = overlayPath
 		} else {
 			// This should fail with ErrBackingChainTooDeep
@@ -1984,4 +1980,455 @@ func TestBackingChainDepthLimit(t *testing.T) {
 	}
 
 	t.Error("Expected backing chain depth limit to be enforced")
+}
+
+func TestWriteAtCompressedCompressibleData(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "compressed.qcow2")
+
+	// Create a 1MB image
+	img, err := CreateSimple(path, 1024*1024)
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+
+	// Set compression level
+	img.SetCompressionLevel(CompressionDefault)
+
+	// Create highly compressible data (all zeros)
+	data := make([]byte, img.ClusterSize())
+
+	// Write compressed
+	n, err := img.WriteAtCompressed(data, 0)
+	if err != nil {
+		t.Fatalf("WriteAtCompressed failed: %v", err)
+	}
+	if n != len(data) {
+		t.Errorf("WriteAtCompressed returned %d, want %d", n, len(data))
+	}
+
+	// Read back and verify
+	readBuf := make([]byte, img.ClusterSize())
+	_, err = img.ReadAt(readBuf, 0)
+	if err != nil {
+		t.Fatalf("ReadAt failed: %v", err)
+	}
+	if !bytes.Equal(readBuf, data) {
+		t.Error("Read data doesn't match written data")
+	}
+
+	img.Close()
+
+	// Reopen and verify data persists
+	img2, err := Open(path)
+	if err != nil {
+		t.Fatalf("Reopen failed: %v", err)
+	}
+	defer img2.Close()
+
+	readBuf2 := make([]byte, img2.ClusterSize())
+	_, err = img2.ReadAt(readBuf2, 0)
+	if err != nil {
+		t.Fatalf("ReadAt after reopen failed: %v", err)
+	}
+	if !bytes.Equal(readBuf2, data) {
+		t.Error("Read data after reopen doesn't match")
+	}
+}
+
+func TestWriteAtCompressedPatternData(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "compressed_pattern.qcow2")
+
+	img, err := CreateSimple(path, 1024*1024)
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+	defer img.Close()
+
+	img.SetCompressionLevel(CompressionDefault)
+
+	// Create compressible data with repeating pattern
+	data := make([]byte, img.ClusterSize())
+	pattern := []byte("This is a test pattern that repeats!")
+	for i := 0; i < len(data); i += len(pattern) {
+		copy(data[i:], pattern)
+	}
+
+	// Write compressed
+	n, err := img.WriteAtCompressed(data, 0)
+	if err != nil {
+		t.Fatalf("WriteAtCompressed failed: %v", err)
+	}
+	if n != len(data) {
+		t.Errorf("WriteAtCompressed returned %d, want %d", n, len(data))
+	}
+
+	// Read back and verify
+	readBuf := make([]byte, img.ClusterSize())
+	_, err = img.ReadAt(readBuf, 0)
+	if err != nil {
+		t.Fatalf("ReadAt failed: %v", err)
+	}
+	if !bytes.Equal(readBuf, data) {
+		t.Error("Read data doesn't match written data")
+	}
+}
+
+func TestWriteAtCompressedRandomData(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "compressed_random.qcow2")
+
+	img, err := CreateSimple(path, 1024*1024)
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+	defer img.Close()
+
+	img.SetCompressionLevel(CompressionDefault)
+
+	// Create incompressible data (pseudo-random)
+	data := make([]byte, img.ClusterSize())
+	for i := range data {
+		// Simple PRNG
+		data[i] = byte((i * 7919) ^ (i >> 3))
+	}
+
+	// Write - should fall back to uncompressed since random data doesn't compress
+	n, err := img.WriteAtCompressed(data, 0)
+	if err != nil {
+		t.Fatalf("WriteAtCompressed failed: %v", err)
+	}
+	if n != len(data) {
+		t.Errorf("WriteAtCompressed returned %d, want %d", n, len(data))
+	}
+
+	// Read back and verify
+	readBuf := make([]byte, img.ClusterSize())
+	_, err = img.ReadAt(readBuf, 0)
+	if err != nil {
+		t.Fatalf("ReadAt failed: %v", err)
+	}
+	if !bytes.Equal(readBuf, data) {
+		t.Error("Read data doesn't match written data")
+	}
+}
+
+func TestWriteAtCompressedUnaligned(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "compressed_unaligned.qcow2")
+
+	img, err := CreateSimple(path, 1024*1024)
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+	defer img.Close()
+
+	img.SetCompressionLevel(CompressionDefault)
+
+	data := make([]byte, img.ClusterSize())
+
+	// Writing at unaligned offset should fail
+	_, err = img.WriteAtCompressed(data, 512)
+	if err == nil {
+		t.Error("WriteAtCompressed with unaligned offset should fail")
+	}
+}
+
+func TestWriteAtCompressedPartialCluster(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "compressed_partial.qcow2")
+
+	img, err := CreateSimple(path, 1024*1024)
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+	defer img.Close()
+
+	img.SetCompressionLevel(CompressionDefault)
+
+	// Partial cluster should fail
+	data := make([]byte, 4096)
+	_, err = img.WriteAtCompressed(data, 0)
+	if err == nil {
+		t.Error("WriteAtCompressed with partial cluster should fail")
+	}
+}
+
+func TestCompressionLevelSettings(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "compression_level.qcow2")
+
+	img, err := CreateSimple(path, 1024*1024)
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+	defer img.Close()
+
+	// Default should be disabled
+	if img.GetCompressionLevel() != CompressionDisabled {
+		t.Errorf("Default compression level should be Disabled, got %d", img.GetCompressionLevel())
+	}
+
+	// Set to Fast
+	img.SetCompressionLevel(CompressionFast)
+	if img.GetCompressionLevel() != CompressionFast {
+		t.Errorf("After SetCompressionLevel(Fast), got %d", img.GetCompressionLevel())
+	}
+
+	// Set to Default
+	img.SetCompressionLevel(CompressionDefault)
+	if img.GetCompressionLevel() != CompressionDefault {
+		t.Errorf("After SetCompressionLevel(Default), got %d", img.GetCompressionLevel())
+	}
+
+	// Set to Best
+	img.SetCompressionLevel(CompressionBest)
+	if img.GetCompressionLevel() != CompressionBest {
+		t.Errorf("After SetCompressionLevel(Best), got %d", img.GetCompressionLevel())
+	}
+}
+
+func TestEncryptedImageDetection(t *testing.T) {
+	t.Parallel()
+
+	// Test LUKS encryption rejection (method=2)
+	// AES (method=1) is now supported (read-only), LUKS is not yet
+	dir := t.TempDir()
+	path := filepath.Join(dir, "encrypted.qcow2")
+
+	// Create a minimal QCOW2 header with encryption method = 2 (LUKS)
+	header := make([]byte, HeaderSizeV3)
+
+	// Magic
+	binary.BigEndian.PutUint32(header[0:4], Magic)
+	// Version 3
+	binary.BigEndian.PutUint32(header[4:8], 3)
+	// No backing file
+	binary.BigEndian.PutUint64(header[8:16], 0)
+	binary.BigEndian.PutUint32(header[16:20], 0)
+	// Cluster bits = 16 (64KB)
+	binary.BigEndian.PutUint32(header[20:24], 16)
+	// Virtual size = 1MB
+	binary.BigEndian.PutUint64(header[24:32], 1024*1024)
+	// Encryption method = 2 (LUKS) - THIS SHOULD CAUSE REJECTION
+	binary.BigEndian.PutUint32(header[32:36], EncryptionLUKS)
+	// L1 size
+	binary.BigEndian.PutUint32(header[36:40], 1)
+	// L1 table offset
+	binary.BigEndian.PutUint64(header[40:48], 0x30000)
+	// Refcount table offset
+	binary.BigEndian.PutUint64(header[48:56], 0x10000)
+	// Refcount table clusters
+	binary.BigEndian.PutUint32(header[56:60], 1)
+	// No snapshots
+	binary.BigEndian.PutUint32(header[60:64], 0)
+	binary.BigEndian.PutUint64(header[64:72], 0)
+	// V3 fields
+	binary.BigEndian.PutUint64(header[72:80], 0) // Incompatible features
+	binary.BigEndian.PutUint64(header[80:88], 0) // Compatible features
+	binary.BigEndian.PutUint64(header[88:96], 0) // Autoclear features
+	binary.BigEndian.PutUint32(header[96:100], 4) // Refcount order
+	binary.BigEndian.PutUint32(header[100:104], HeaderSizeV3) // Header length
+
+	// Write header to file
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("Failed to create file: %v", err)
+	}
+	if _, err := f.Write(header); err != nil {
+		f.Close()
+		t.Fatalf("Failed to write header: %v", err)
+	}
+	f.Close()
+
+	// Try to open - should fail with encrypted image error (LUKS not supported)
+	_, err = Open(path)
+	if err == nil {
+		t.Error("Open should fail for LUKS encrypted image")
+	}
+	if !errors.Is(err, ErrEncryptedImage) {
+		t.Errorf("Expected ErrEncryptedImage for LUKS, got: %v", err)
+	}
+}
+
+func TestHeaderEncryptionMethods(t *testing.T) {
+	// Test IsEncrypted and EncryptionMethod on headers
+	tests := []struct {
+		method      uint32
+		isEncrypted bool
+	}{
+		{EncryptionNone, false},
+		{EncryptionAES, true},
+		{EncryptionLUKS, true},
+	}
+
+	for _, tc := range tests {
+		h := &Header{EncryptMethod: tc.method}
+		if h.IsEncrypted() != tc.isEncrypted {
+			t.Errorf("EncryptMethod=%d: IsEncrypted()=%v, want %v",
+				tc.method, h.IsEncrypted(), tc.isEncrypted)
+		}
+		if h.EncryptionMethod() != tc.method {
+			t.Errorf("EncryptMethod=%d: EncryptionMethod()=%d, want %d",
+				tc.method, h.EncryptionMethod(), tc.method)
+		}
+	}
+}
+
+func TestWriteAtCompressedZstd(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "zstd_compressed.qcow2")
+
+	img, err := CreateSimple(path, 1024*1024)
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+
+	// Enable zstd compression
+	img.SetCompressionLevel(CompressionDefault)
+	img.SetCompressionType(CompressionZstd)
+
+	// Create compressible data (zeros compress very well)
+	data := make([]byte, img.ClusterSize())
+
+	// Write compressed with zstd
+	n, err := img.WriteAtCompressed(data, 0)
+	if err != nil {
+		t.Fatalf("WriteAtCompressed with zstd failed: %v", err)
+	}
+	if n != len(data) {
+		t.Errorf("WriteAtCompressed returned %d, want %d", n, len(data))
+	}
+
+	img.Close()
+
+	// Reopen - header should now have compression type persisted
+	img2, err := Open(path)
+	if err != nil {
+		t.Fatalf("Reopen failed: %v", err)
+	}
+	defer img2.Close()
+
+	// Verify compression type was persisted
+	if img2.header.CompressionType != CompressionZstd {
+		t.Errorf("Compression type not persisted: got %d, want %d",
+			img2.header.CompressionType, CompressionZstd)
+	}
+
+	// Read back and verify
+	readBuf := make([]byte, img2.ClusterSize())
+	_, err = img2.ReadAt(readBuf, 0)
+	if err != nil {
+		t.Fatalf("ReadAt failed: %v", err)
+	}
+	if !bytes.Equal(readBuf, data) {
+		t.Error("Read data doesn't match written data")
+	}
+}
+
+func TestCompressionTypeSettings(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "compression_type.qcow2")
+
+	img, err := CreateSimple(path, 1024*1024)
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+	defer img.Close()
+
+	// Default should be zlib (0)
+	if img.GetCompressionType() != CompressionZlib {
+		t.Errorf("Default compression type should be Zlib (0), got %d", img.GetCompressionType())
+	}
+
+	// Set to zstd
+	img.SetCompressionType(CompressionZstd)
+	if img.GetCompressionType() != CompressionZstd {
+		t.Errorf("After SetCompressionType(Zstd), got %d", img.GetCompressionType())
+	}
+
+	// Set back to zlib
+	img.SetCompressionType(CompressionZlib)
+	if img.GetCompressionType() != CompressionZlib {
+		t.Errorf("After SetCompressionType(Zlib), got %d", img.GetCompressionType())
+	}
+}
+
+func TestExternalDataFile(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	imgPath := filepath.Join(dir, "test.qcow2")
+	dataPath := filepath.Join(dir, "test.raw")
+
+	// Create a qcow2 image with external data file using qemu-img
+	result := testutil.RunQemuImg(t, "create", "-f", "qcow2", "-o", "data_file="+dataPath, imgPath, "1M")
+	if result.ExitCode != 0 {
+		t.Skipf("qemu-img doesn't support external data files: %s", result.Stderr)
+	}
+
+	// Open the image
+	img, err := Open(imgPath)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer img.Close()
+
+	// Verify external data file was detected
+	if !img.header.HasExternalDataFile() {
+		t.Fatal("Expected HasExternalDataFile() to be true")
+	}
+
+	if img.extensions.ExternalDataFile != dataPath {
+		t.Errorf("ExternalDataFile = %q, want %q", img.extensions.ExternalDataFile, dataPath)
+	}
+
+	// Write test data
+	testData := []byte("Hello, External Data File!")
+	testData = append(testData, make([]byte, 64*1024-len(testData))...) // Pad to cluster size
+
+	n, err := img.WriteAt(testData, 0)
+	if err != nil {
+		t.Fatalf("WriteAt failed: %v", err)
+	}
+	if n != len(testData) {
+		t.Errorf("WriteAt = %d, want %d", n, len(testData))
+	}
+
+	img.Close()
+
+	// Reopen and verify data persists
+	img2, err := Open(imgPath)
+	if err != nil {
+		t.Fatalf("Reopen failed: %v", err)
+	}
+	defer img2.Close()
+
+	// Read data back
+	readBuf := make([]byte, len(testData))
+	n, err = img2.ReadAt(readBuf, 0)
+	if err != nil && err != io.EOF {
+		t.Fatalf("ReadAt failed: %v", err)
+	}
+	if n != len(testData) {
+		t.Errorf("ReadAt = %d, want %d", n, len(testData))
+	}
+
+	if !bytes.Equal(readBuf, testData) {
+		t.Errorf("Data mismatch: read %q, want %q", readBuf[:50], testData[:50])
+	}
+
+	// Verify qemu-img check passes
+	checkResult := testutil.QemuCheck(t, imgPath)
+	if !checkResult.IsClean {
+		t.Errorf("qemu-img check failed: %s", checkResult.Stderr)
+	}
 }

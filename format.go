@@ -170,9 +170,12 @@ var (
 	ErrCorruptImage           = errors.New("qcow2: image is marked corrupt")
 	ErrImageDirty             = errors.New("qcow2: image is marked dirty, needs repair")
 	ErrOffsetOutOfRange       = errors.New("qcow2: offset out of range")
-	ErrReadOnly               = errors.New("qcow2: image is read-only")
-	ErrBackingChainTooDeep    = errors.New("qcow2: backing file chain exceeds maximum depth")
-	ErrUnsupportedCompression = errors.New("qcow2: unsupported compression type (zstd requires external library)")
+	ErrReadOnly                 = errors.New("qcow2: image is read-only")
+	ErrBackingChainTooDeep      = errors.New("qcow2: backing file chain exceeds maximum depth")
+	ErrUnsupportedCompression   = errors.New("qcow2: unsupported compression type (zstd requires external library)")
+	ErrCompressionNotBeneficial = errors.New("qcow2: compression not beneficial for this data")
+	ErrEncryptedImage           = errors.New("qcow2: encrypted images are not supported")
+	ErrExternalDataFileMissing  = errors.New("qcow2: external data file name not specified in header extension")
 )
 
 // ParseHeader reads and validates a QCOW2 header from raw bytes.
@@ -236,9 +239,23 @@ func ParseHeader(data []byte) (*Header, error) {
 
 // Validate checks if the header is valid and if we support all required features.
 func (h *Header) Validate() error {
+	// Check for encryption - we support legacy AES (read-only) and reject LUKS for now
+	switch h.EncryptMethod {
+	case EncryptionNone:
+		// No encryption, all good
+	case EncryptionAES:
+		// Legacy AES encryption supported (read-only, requires SetPassword)
+		// Note: This is insecure and deprecated, only for data recovery
+	case EncryptionLUKS:
+		// LUKS not yet supported
+		return fmt.Errorf("%w: LUKS encryption (method=2) not yet supported", ErrEncryptedImage)
+	default:
+		return fmt.Errorf("%w: unknown method=%d", ErrEncryptedImage, h.EncryptMethod)
+	}
+
 	// Check for unsupported incompatible features
-	// We currently don't support any incompatible features except dirty bit
-	supportedIncompat := uint64(IncompatDirtyBit)
+	// We support dirty bit, compression type in header, and external data files
+	supportedIncompat := uint64(IncompatDirtyBit | IncompatCompression | IncompatExternalData)
 	if h.IncompatibleFeatures & ^supportedIncompat != 0 {
 		return fmt.Errorf("%w: 0x%x", ErrIncompatFeatures, h.IncompatibleFeatures)
 	}
@@ -248,6 +265,17 @@ func (h *Header) Validate() error {
 	}
 
 	return nil
+}
+
+// IsEncrypted returns true if the image uses encryption.
+func (h *Header) IsEncrypted() bool {
+	return h.EncryptMethod != EncryptionNone
+}
+
+// EncryptionMethod returns the encryption method used by this image.
+// Returns EncryptionNone (0), EncryptionAES (1), or EncryptionLUKS (2).
+func (h *Header) EncryptionMethod() uint32 {
+	return h.EncryptMethod
 }
 
 // ClusterSize returns the cluster size in bytes.
@@ -274,6 +302,11 @@ func (h *Header) IsDirty() bool {
 // HasLazyRefcounts returns true if lazy refcount updates are enabled.
 func (h *Header) HasLazyRefcounts() bool {
 	return h.CompatibleFeatures&CompatLazyRefcounts != 0
+}
+
+// HasExternalDataFile returns true if cluster data is stored in an external file.
+func (h *Header) HasExternalDataFile() bool {
+	return h.IncompatibleFeatures&IncompatExternalData != 0
 }
 
 // Encode serializes the header to bytes.

@@ -86,7 +86,6 @@ func parseSnapshot(r io.ReaderAt, offset int64) (*Snapshot, int64, error) {
 			return nil, 0, fmt.Errorf("qcow2: failed to read snapshot name: %w", err)
 		}
 		snap.Name = string(nameBuf)
-		pos += int64(nameSize)
 	}
 
 	// Calculate total entry size with padding to 8-byte boundary
@@ -193,8 +192,8 @@ func (img *Image) ReadAtSnapshot(p []byte, off int64, snap *Snapshot) (int, erro
 			copy(p[totalRead:], decompressed[clusterOff:clusterOff+readLen])
 
 		case clusterNormal:
-			// Read from physical offset
-			n, err := img.file.ReadAt(p[totalRead:totalRead+int(readLen)], int64(info.physOff))
+			// Read from physical offset (use dataFile for external data file support)
+			n, err := img.dataFile().ReadAt(p[totalRead:totalRead+int(readLen)], int64(info.physOff))
 			if err != nil && err != io.EOF {
 				return totalRead, err
 			}

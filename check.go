@@ -91,7 +91,7 @@ func (img *Image) Check() (*CheckResult, error) {
 		}
 
 		// Validate L2 table offset
-		if l2Offset&uint64(img.clusterSize-1) != 0 {
+		if l2Offset&(img.clusterSize-1) != 0 {
 			result.Corruptions++
 			result.Errors = append(result.Errors,
 				fmt.Sprintf("L1[%d]: L2 table offset 0x%x is not cluster-aligned", i, l2Offset))
@@ -132,7 +132,7 @@ func (img *Image) Check() (*CheckResult, error) {
 			}
 
 			// Validate data cluster offset alignment
-			if dataOffset&uint64(img.clusterSize-1) != 0 {
+			if dataOffset&(img.clusterSize-1) != 0 {
 				result.Corruptions++
 				result.Errors = append(result.Errors,
 					fmt.Sprintf("L2[%d][%d]: data offset 0x%x is not cluster-aligned", i, j, dataOffset))

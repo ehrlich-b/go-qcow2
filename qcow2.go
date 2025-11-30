@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 )
 
@@ -17,8 +19,9 @@ type BackingStore interface {
 // Image is the primary interface for interacting with a QCOW2 image.
 // It implements io.ReaderAt and io.WriterAt for random access.
 type Image struct {
-	file   *os.File
-	header *Header
+	file             *os.File
+	externalDataFile *os.File // External data file (when IncompatExternalData is set)
+	header           *Header
 
 	// Derived values cached for performance
 	clusterSize uint64
@@ -73,6 +76,15 @@ type Image struct {
 	// Pending sync flag for batched barrier mode
 	pendingSync bool
 
+	// Compression level for write operations (CompressionDisabled by default)
+	compressionLevel CompressionLevel
+
+	// Compression type for write operations (deflate by default, can be zstd)
+	compressionType uint8
+
+	// AES decryptor for legacy encrypted images (method=1)
+	aesDecryptor *AESDecryptor
+
 	// Buffer pool for cluster-sized allocations
 	clusterPool sync.Pool
 }
@@ -80,11 +92,16 @@ type Image struct {
 // getClusterBuffer retrieves a cluster-sized buffer from the pool.
 // The buffer contents are undefined; caller must initialize if needed.
 func (img *Image) getClusterBuffer() []byte {
-	return img.clusterPool.Get().([]byte)
+	buf, ok := img.clusterPool.Get().([]byte)
+	if !ok {
+		panic("qcow2: cluster pool type assertion failed")
+	}
+	return buf
 }
 
 // putClusterBuffer returns a cluster-sized buffer to the pool.
 func (img *Image) putClusterBuffer(buf []byte) {
+	//nolint:staticcheck // SA6002: []byte is reference type, underlying array is heap-allocated
 	img.clusterPool.Put(buf)
 }
 
@@ -95,6 +112,15 @@ func (img *Image) getZeroedClusterBuffer() []byte {
 		buf[i] = 0
 	}
 	return buf
+}
+
+// dataFile returns the file handle for cluster data I/O.
+// If an external data file is configured, returns that; otherwise returns the main image file.
+func (img *Image) dataFile() *os.File {
+	if img.externalDataFile != nil {
+		return img.externalDataFile
+	}
+	return img.file
 }
 
 // metadataBarrier issues a sync if barrier mode requires it for metadata updates.
@@ -121,7 +147,8 @@ func (img *Image) dataBarrier() error {
 	case BarrierMetadata:
 		return nil
 	case BarrierFull:
-		return img.file.Sync()
+		// Sync the data file (external or main)
+		return img.dataFile().Sync()
 	}
 	return nil
 }
@@ -135,6 +162,30 @@ func (img *Image) SetWriteBarrierMode(mode WriteBarrierMode) {
 // WriteBarrierMode returns the current write ordering barrier mode.
 func (img *Image) WriteBarrierMode() WriteBarrierMode {
 	return img.barrierMode
+}
+
+// SetCompressionLevel sets the compression level for write operations.
+// When set to a value other than CompressionDisabled, full cluster writes
+// will be compressed if beneficial. Partial cluster writes are never compressed.
+func (img *Image) SetCompressionLevel(level CompressionLevel) {
+	img.compressionLevel = level
+}
+
+// CompressionLevel returns the current compression level setting.
+func (img *Image) GetCompressionLevel() CompressionLevel {
+	return img.compressionLevel
+}
+
+// SetCompressionType sets the compression type for write operations.
+// Use CompressionZlib (default) or CompressionZstd.
+// Note: When writing compressed clusters, the type is stored in the header.
+func (img *Image) SetCompressionType(ctype uint8) {
+	img.compressionType = ctype
+}
+
+// GetCompressionType returns the current compression type setting.
+func (img *Image) GetCompressionType() uint8 {
+	return img.compressionType
 }
 
 // Open opens an existing QCOW2 image file.
@@ -169,8 +220,8 @@ func openFileWithDepth(path string, flag int, perm os.FileMode, depth int) (*Ima
 
 // newImage creates an Image from an already-open file.
 func newImage(f *os.File, readOnly bool, chainDepth int) (*Image, error) {
-	// Read header
-	headerBuf := make([]byte, HeaderSizeV3)
+	// Read header (include extra byte for compression type at offset 104)
+	headerBuf := make([]byte, HeaderSizeV3+1)
 	n, err := f.ReadAt(headerBuf, 0)
 	if err != nil && err != io.EOF {
 		return nil, fmt.Errorf("qcow2: failed to read header: %w", err)
@@ -247,6 +298,11 @@ func newImage(f *os.File, readOnly bool, chainDepth int) (*Image, error) {
 	}
 	img.extensions = extensions
 
+	// Open external data file if required
+	if err := img.openExternalDataFile(f.Name(), readOnly); err != nil {
+		return nil, err
+	}
+
 	// Load snapshots if present
 	if err := img.loadSnapshots(); err != nil {
 		return nil, fmt.Errorf("qcow2: failed to load snapshots: %w", err)
@@ -258,6 +314,49 @@ func newImage(f *os.File, readOnly bool, chainDepth int) (*Image, error) {
 	}
 
 	return img, nil
+}
+
+// openExternalDataFile opens the external data file if the image requires one.
+func (img *Image) openExternalDataFile(imagePath string, readOnly bool) error {
+	if !img.header.HasExternalDataFile() {
+		return nil // No external data file required
+	}
+
+	// External data file name should be in the header extensions
+	if img.extensions == nil || img.extensions.ExternalDataFile == "" {
+		return ErrExternalDataFileMissing
+	}
+
+	dataPath := img.extensions.ExternalDataFile
+
+	// Validate path
+	if strings.ContainsRune(dataPath, 0) {
+		return fmt.Errorf("qcow2: external data file path contains null byte")
+	}
+	dataPath = strings.TrimSpace(dataPath)
+	if dataPath == "" {
+		return ErrExternalDataFileMissing
+	}
+
+	// Resolve relative paths relative to the image file
+	if !filepath.IsAbs(dataPath) {
+		imgDir := filepath.Dir(imagePath)
+		dataPath = filepath.Join(imgDir, dataPath)
+	}
+
+	// Open the external data file
+	flag := os.O_RDWR
+	if readOnly {
+		flag = os.O_RDONLY
+	}
+
+	f, err := os.OpenFile(dataPath, flag, 0)
+	if err != nil {
+		return fmt.Errorf("qcow2: failed to open external data file %q: %w", dataPath, err)
+	}
+
+	img.externalDataFile = f
+	return nil
 }
 
 // markDirty sets the dirty bit in the header.
@@ -346,11 +445,21 @@ func (img *Image) ReadAt(p []byte, off int64) (n int, err error) {
 
 		switch info.ctype {
 		case clusterNormal:
-			// Read from allocated cluster
-			read, err := img.file.ReadAt(p[:toRead], int64(info.physOff))
-			n += read
-			if err != nil {
-				return n, err
+			// Read from allocated cluster (use dataFile for external data file support)
+			if img.header.EncryptMethod == EncryptionAES {
+				// Encrypted image - need to decrypt
+				read, err := img.readEncrypted(p[:toRead], info.physOff, uint64(off))
+				n += read
+				if err != nil {
+					return n, err
+				}
+			} else {
+				// Normal unencrypted read
+				read, err := img.dataFile().ReadAt(p[:toRead], int64(info.physOff))
+				n += read
+				if err != nil {
+					return n, err
+				}
 			}
 
 		case clusterZero:
@@ -411,6 +520,11 @@ func (img *Image) WriteAt(p []byte, off int64) (n int, err error) {
 		return 0, ErrReadOnly
 	}
 
+	// Writing to encrypted images is not supported
+	if img.header.EncryptMethod != EncryptionNone {
+		return 0, fmt.Errorf("qcow2: writing to encrypted images is not supported")
+	}
+
 	if off < 0 {
 		return 0, ErrOffsetOutOfRange
 	}
@@ -439,8 +553,8 @@ func (img *Image) WriteAt(p []byte, off int64) (n int, err error) {
 			return n, err
 		}
 
-		// Write to allocated cluster
-		written, err := img.file.WriteAt(p[:toWrite], int64(physOff))
+		// Write to allocated cluster (use dataFile for external data file support)
+		written, err := img.dataFile().WriteAt(p[:toWrite], int64(physOff))
 		n += written
 		if err != nil {
 			return n, err
@@ -726,15 +840,16 @@ func (img *Image) getClusterForWrite(virtOff uint64) (uint64, error) {
 		}
 
 		// COW: Copy existing data to new cluster
+		dataFile := img.dataFile() // Use external data file if present
 		if needsCOW {
 			// Read from old cluster
 			clusterData := make([]byte, img.clusterSize)
-			if _, err := img.file.ReadAt(clusterData, int64(oldPhysOff)); err != nil {
+			if _, err := dataFile.ReadAt(clusterData, int64(oldPhysOff)); err != nil {
 				return 0, fmt.Errorf("qcow2: COW read failed: %w", err)
 			}
 
 			// Write to new cluster
-			if _, err := img.file.WriteAt(clusterData, int64(physOff)); err != nil {
+			if _, err := dataFile.WriteAt(clusterData, int64(physOff)); err != nil {
 				return 0, fmt.Errorf("qcow2: COW write failed: %w", err)
 			}
 
@@ -754,7 +869,7 @@ func (img *Image) getClusterForWrite(virtOff uint64) (uint64, error) {
 			}
 
 			// Write the backing data to our new cluster
-			if _, err := img.file.WriteAt(clusterData, int64(physOff)); err != nil {
+			if _, err := dataFile.WriteAt(clusterData, int64(physOff)); err != nil {
 				return 0, fmt.Errorf("qcow2: COW write failed: %w", err)
 			}
 		}
@@ -794,12 +909,13 @@ func (img *Image) allocateCluster() (uint64, error) {
 	// In lazy refcounts mode, skip free cluster search - always grow file.
 	// This is because refcounts aren't updated in lazy mode, so we can't
 	// reliably determine which clusters are free.
+	dataFile := img.dataFile() // Use external data file if present
 	if !img.lazyRefcounts {
 		// Try to find a free cluster first
 		if offset, found := img.findFreeCluster(); found {
 			// Zero the cluster before reuse
 			zeros := make([]byte, img.clusterSize)
-			if _, err := img.file.WriteAt(zeros, int64(offset)); err != nil {
+			if _, err := dataFile.WriteAt(zeros, int64(offset)); err != nil {
 				return 0, err
 			}
 
@@ -813,7 +929,7 @@ func (img *Image) allocateCluster() (uint64, error) {
 	}
 
 	// No free clusters found, grow the file
-	info, err := img.file.Stat()
+	info, err := dataFile.Stat()
 	if err != nil {
 		return 0, err
 	}
@@ -825,7 +941,7 @@ func (img *Image) allocateCluster() (uint64, error) {
 	}
 
 	// Extend file
-	if err := img.file.Truncate(int64(offset + img.clusterSize)); err != nil {
+	if err := dataFile.Truncate(int64(offset + img.clusterSize)); err != nil {
 		return 0, err
 	}
 
@@ -1063,6 +1179,13 @@ func (img *Image) CheckOverlap(hostOffset uint64) OverlapCheckResult {
 // Flush syncs all pending writes to disk.
 func (img *Image) Flush() error {
 	if img.dirty || img.pendingSync {
+		// Sync external data file first if present
+		if img.externalDataFile != nil {
+			if err := img.externalDataFile.Sync(); err != nil {
+				return err
+			}
+		}
+		// Then sync main metadata file
 		if err := img.file.Sync(); err != nil {
 			return err
 		}
@@ -1094,6 +1217,14 @@ func (img *Image) Close() error {
 			return err
 		}
 	}
+
+	// Close external data file if present
+	if img.externalDataFile != nil {
+		if err := img.externalDataFile.Close(); err != nil {
+			return err
+		}
+	}
+
 	return img.file.Close()
 }
 

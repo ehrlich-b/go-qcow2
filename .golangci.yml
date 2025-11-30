@@ -1,0 +1,77 @@
+# golangci-lint configuration for go-qcow2
+# Strict config for a serious systems library handling disk images
+
+run:
+  timeout: 5m
+
+linters:
+  enable:
+    # Correctness - these catch real bugs
+    - errcheck
+    - govet
+    - staticcheck
+    - ineffassign
+    - unused
+    - gosec
+    - errorlint
+    - nilerr
+
+    # Code quality
+    - gosimple
+    - unconvert
+    - unparam
+    - misspell
+    - gocritic
+
+linters-settings:
+  errcheck:
+    check-type-assertions: true
+    check-blank: true
+    exclude-functions:
+      - (io.Closer).Close
+      - (*os.File).Close
+
+  govet:
+    enable-all: true
+    disable:
+      - fieldalignment  # Struct layout matches on-disk binary format
+      - shadow          # err shadowing is idiomatic Go
+
+  staticcheck:
+    checks:
+      - "all"
+      - "-SA9003"  # Empty branch with comment = intentional error ignoring
+
+  gosec:
+    excludes:
+      - G115  # Integer conversions are intentional in binary format code
+      - G404  # math/rand fine for non-crypto (test data)
+
+  errorlint:
+    errorf: true       # Missing %w in error wrapping is a real bug
+    asserts: true      # Type assertions should use errors.As
+    comparison: false  # err == io.EOF is fine; sentinels aren't wrapped
+
+  gocritic:
+    enabled-tags:
+      - diagnostic
+      - performance
+    disabled-checks:
+      - hugeParam      # Binary format structs are large by design
+      - ifElseChain    # if-else often clearer than switch for complex conditions
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+  exclude-rules:
+    # Tests: relax rules that don't catch real bugs
+    - path: _test\.go
+      linters:
+        - errcheck  # Test helpers skip error checks intentionally
+        - gosec     # Security in tests doesn't matter
+        - unparam   # Test params unused for interface conformance
+
+  exclude-dirs:
+    - vendor
+    - testdata

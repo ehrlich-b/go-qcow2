@@ -90,9 +90,7 @@ func (img *Image) parseHeaderExtensions() (*HeaderExtensions, error) {
 			extensions.BackingFormat = string(data)
 
 		case ExtensionFeatureNameTable:
-			if err := parseFeatureNameTable(data, extensions.FeatureNames); err != nil {
-				return nil, err
-			}
+			parseFeatureNameTable(data, extensions.FeatureNames)
 
 		case ExtensionExternalDataFile:
 			extensions.ExternalDataFile = string(data)
@@ -121,7 +119,7 @@ func (img *Image) parseHeaderExtensions() (*HeaderExtensions, error) {
 //   - 1 byte: feature type (0=incompatible, 1=compatible, 2=autoclear)
 //   - 1 byte: bit number
 //   - 46 bytes: null-terminated name
-func parseFeatureNameTable(data []byte, names map[string]string) error {
+func parseFeatureNameTable(data []byte, names map[string]string) {
 	const entrySize = 48
 	for i := 0; i+entrySize <= len(data); i += entrySize {
 		featureType := data[i]
@@ -156,7 +154,6 @@ func parseFeatureNameTable(data []byte, names map[string]string) error {
 		key := fmt.Sprintf("%s_%d", typeStr, bitNumber)
 		names[key] = name
 	}
-	return nil
 }
 
 // Extensions returns the parsed header extensions.

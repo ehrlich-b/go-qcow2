@@ -166,13 +166,13 @@ func TestFreeClusterBitmapWrapAround(t *testing.T) {
 	b.setFree(5)
 
 	// Find next - should wrap around and find remaining
-	clusterIdx, found = b.findFree()
+	_, found = b.findFree()
 	if !found {
 		t.Error("Third findFree should succeed")
 	}
 
 	// Last findFree should wrap around
-	clusterIdx, found = b.findFree()
+	_, found = b.findFree()
 	if !found {
 		t.Error("Fourth findFree should succeed")
 	}

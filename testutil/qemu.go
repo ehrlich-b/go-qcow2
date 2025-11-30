@@ -4,6 +4,7 @@ package testutil
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -103,7 +104,8 @@ func runCommand(t *testing.T, name string, args ...string) QemuResult {
 	}
 
 	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
 			result.ExitCode = exitErr.ExitCode()
 		} else {
 			t.Logf("%s error: %v", name, err)

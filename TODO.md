@@ -96,15 +96,36 @@
 ## Phase 4: Advanced Features
 
 ### Compression - Writing
-- [ ] Compress clusters on write (optional)
-- [ ] Deflate compression
-- [ ] Zstd compression
-- [ ] Compression level selection
+- [x] Compress clusters on write (optional)
+- [x] Deflate compression
+- [x] Compression level selection
+
+### Zstd Compression (klauspost/compress/zstd - pure Go) ✅
+- [x] Add klauspost/compress/zstd dependency
+- [x] Implement zstd decompression for reading compressed clusters
+- [x] Implement zstd compression for writing
+- [x] Add compression type header extension support
 
 ### Encryption
-- [ ] Detect encryption method from header
-- [ ] AES encryption (legacy, method=1)
-- [ ] LUKS encryption (modern, method=2)
+- [x] Detect encryption method from header (returns ErrEncryptedImage)
+
+### AES Encryption (legacy, method=1 - DEPRECATED) ✅
+> Note: [Deprecated by QEMU in 2015](https://www.berrange.com/posts/2015/03/17/qemu-qcow2-built-in-encryption-just-say-no-deprecated-now-to-be-deleted-soon/), broken by design. Implement read-only for legacy image compatibility.
+- [x] Implement AES-128-CBC decryption using crypto/aes (stdlib)
+- [x] Derive key from passphrase (direct copy, no PBKDF - matches QEMU)
+- [x] Per-sector IV generation (PLAIN64: sector offset as little-endian uint64)
+- [x] Read-only support for legacy encrypted images
+- [x] Clear security warning in API docs
+
+### LUKS Encryption (modern, method=2)
+> Using [anatol/luks.go](https://github.com/anatol/luks.go) pure Go library for LUKS header parsing
+- [ ] Research QCOW2 LUKS payload storage format (header at special offset)
+- [ ] Add anatol/luks.go dependency
+- [ ] Parse LUKS header from QCOW2 encrypt.format extension
+- [ ] Implement LUKS key derivation (PBKDF2)
+- [ ] Implement sector-level decryption with ESSIV
+- [ ] Read support for LUKS-encrypted images
+- [ ] Future: Write support
 
 ### Extended L2 Entries
 - [ ] Detect incompatible feature bit 4
@@ -115,9 +136,11 @@
 - [ ] Bitmap directory parsing
 - [ ] Dirty tracking for incremental backups
 
-### External Data Files
-- [ ] External data file name extension (0x44415441)
-- [ ] Incompatible feature bit 2
+### External Data Files ✅
+- [x] External data file name extension (0x44415441)
+- [x] Incompatible feature bit 2
+- [x] Route cluster data I/O through external file
+- [x] Support read/write/compress operations with external data
 
 ---
 
@@ -172,8 +195,8 @@
 - [x] Fuzz full image opening
 
 ### Test Infrastructure
-- [ ] Add GitHub Actions CI workflow
-- [ ] Add benchmarks
+- [x] Add GitHub Actions CI workflow
+- [x] Add benchmarks
 
 ---
 
