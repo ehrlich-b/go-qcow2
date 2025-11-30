@@ -318,6 +318,10 @@ func (img *Image) allocateCompressedSpace(size int) (uint64, error) {
 // If compression is not beneficial, falls back to normal uncompressed write.
 // Returns the L2 entry and any error.
 func (img *Image) writeCompressedCluster(virtOff uint64, data []byte) (uint64, error) {
+	// Serialize with write operations to prevent races
+	img.writeMu.Lock()
+	defer img.writeMu.Unlock()
+
 	if len(data) != int(img.clusterSize) {
 		return 0, fmt.Errorf("qcow2: compressed write requires full cluster")
 	}
@@ -422,7 +426,7 @@ func (img *Image) WriteAtCompressed(data []byte, off int64) (int, error) {
 		return 0, err
 	}
 
-	img.dirty = true
+	img.dirty.Store(true)
 	return len(data), nil
 }
 

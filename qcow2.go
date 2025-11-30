@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 // BackingStore is the interface for backing files (qcow2 or raw).
@@ -34,6 +35,10 @@ type Image struct {
 	l1Table []byte
 	l1Mu    sync.RWMutex
 
+	// Write mutex - serializes cluster allocation and L2 updates to prevent
+	// races where multiple goroutines try to allocate the same cluster
+	writeMu sync.Mutex
+
 	// L2 cache - keeps recently used L2 tables in memory
 	l2Cache *l2Cache
 
@@ -49,7 +54,7 @@ type Image struct {
 
 	// Write tracking
 	readOnly bool
-	dirty    bool
+	dirty    atomic.Bool
 
 	// Lazy refcounts mode - defer refcount updates for better write performance
 	lazyRefcounts bool
@@ -630,7 +635,7 @@ func (img *Image) WriteAt(p []byte, off int64) (n int, err error) {
 		off += int64(toWrite)
 	}
 
-	img.dirty = true
+	img.dirty.Store(true)
 	return n, nil
 }
 
@@ -691,7 +696,7 @@ func (img *Image) writeAtLUKS(p []byte, off int64) (n int, err error) {
 		off += int64(toWrite)
 	}
 
-	img.dirty = true
+	img.dirty.Store(true)
 	return n, nil
 }
 
@@ -995,6 +1000,11 @@ func (img *Image) getOrAllocateL2Table(l1Index uint64) (uint64, error) {
 // Allocates a new cluster if needed, or performs COW if the cluster is shared.
 // Handles compressed and zero-flagged clusters by decompressing/allocating as needed.
 func (img *Image) getClusterForWrite(virtOff uint64) (uint64, error) {
+	// Serialize cluster allocation and L2 updates to prevent races where
+	// multiple goroutines try to allocate the same cluster concurrently.
+	img.writeMu.Lock()
+	defer img.writeMu.Unlock()
+
 	// Calculate L1 and L2 indices
 	l2Index := (virtOff >> img.clusterBits) & (img.l2Entries - 1)
 	l1Index := virtOff >> (img.clusterBits + img.l2Bits)
@@ -1561,7 +1571,7 @@ func (img *Image) CheckOverlap(hostOffset uint64) OverlapCheckResult {
 
 // Flush syncs all pending writes to disk.
 func (img *Image) Flush() error {
-	if img.dirty || img.pendingSync {
+	if img.dirty.Load() || img.pendingSync {
 		// Sync external data file first if present
 		if img.externalDataFile != nil {
 			if err := img.externalDataFile.Sync(); err != nil {
@@ -1572,7 +1582,7 @@ func (img *Image) Flush() error {
 		if err := img.file.Sync(); err != nil {
 			return err
 		}
-		img.dirty = false
+		img.dirty.Store(false)
 		img.pendingSync = false
 	}
 	return nil
@@ -1722,7 +1732,7 @@ func (img *Image) WriteZeroAtMode(off int64, length int64, mode ZeroMode) error 
 		break
 	}
 
-	img.dirty = true
+	img.dirty.Store(true)
 	return nil
 }
 
@@ -1730,6 +1740,10 @@ func (img *Image) WriteZeroAtMode(off int64, length int64, mode ZeroMode) error 
 // ZeroPlain: clears the offset and decrements refcount (space efficient).
 // ZeroAlloc: keeps the offset and refcount (preserves allocation).
 func (img *Image) setZeroCluster(virtOff uint64, mode ZeroMode) error {
+	// Serialize with write operations to prevent races
+	img.writeMu.Lock()
+	defer img.writeMu.Unlock()
+
 	// Calculate L1 and L2 indices
 	l2Index := (virtOff >> img.clusterBits) & (img.l2Entries - 1)
 	l1Index := virtOff >> (img.clusterBits + img.l2Bits)

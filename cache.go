@@ -96,11 +96,7 @@ func (c *l2Cache) getShard(offset uint64) *l2CacheShard {
 
 // get retrieves an L2 table from the cache.
 // Returns nil if not found.
-//
-// IMPORTANT: The returned slice is a direct reference to cached data.
-// Callers may read from it freely. Callers that modify the slice MUST
-// call put() afterwards to ensure cache consistency. Concurrent access
-// to different 8-byte entries within the same L2 table is safe.
+// Returns a copy of the cached data for thread-safety.
 func (c *l2Cache) get(offset uint64) []byte {
 	data := c.getShard(offset).get(offset)
 	if data != nil {
@@ -135,6 +131,8 @@ func (c *l2Cache) clear() {
 }
 
 // get retrieves an L2 table from the shard.
+// Returns a copy of the cached data to avoid races when multiple goroutines
+// access the same L2 table concurrently.
 func (s *l2CacheShard) get(offset uint64) []byte {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -147,9 +145,11 @@ func (s *l2CacheShard) get(offset uint64) []byte {
 	// Move to front (most recently used)
 	s.moveToFront(entry)
 
-	// Return direct reference - no copy needed.
-	// Callers reading don't modify, callers writing call put() after.
-	return entry.data
+	// Return a copy to avoid concurrent modification races.
+	// Multiple goroutines may get the same L2 table and modify different entries.
+	result := make([]byte, len(entry.data))
+	copy(result, entry.data)
+	return result
 }
 
 // put adds or updates an L2 table in the shard.

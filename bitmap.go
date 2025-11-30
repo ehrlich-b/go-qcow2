@@ -36,28 +36,28 @@ func newFreeClusterBitmap(numClusters, minCluster uint64) *freeClusterBitmap {
 
 // setFree marks a cluster as free (available for allocation).
 func (b *freeClusterBitmap) setFree(clusterIdx uint64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
 	if clusterIdx >= b.numClusters || clusterIdx < b.minCluster {
 		return
 	}
 	wordIdx := clusterIdx / 64
 	bitIdx := clusterIdx % 64
-
-	b.mu.Lock()
 	b.words[wordIdx] |= 1 << bitIdx
-	b.mu.Unlock()
 }
 
 // setUsed marks a cluster as used (not available for allocation).
 func (b *freeClusterBitmap) setUsed(clusterIdx uint64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
 	if clusterIdx >= b.numClusters {
 		return
 	}
 	wordIdx := clusterIdx / 64
 	bitIdx := clusterIdx % 64
-
-	b.mu.Lock()
 	b.words[wordIdx] &^= 1 << bitIdx
-	b.mu.Unlock()
 }
 
 // findFree finds a free cluster using O(1) bit scanning.
@@ -141,14 +141,14 @@ func (b *freeClusterBitmap) findFree() (uint64, bool) {
 
 // isFree checks if a cluster is marked as free.
 func (b *freeClusterBitmap) isFree(clusterIdx uint64) bool {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
 	if clusterIdx >= b.numClusters {
 		return false
 	}
 	wordIdx := clusterIdx / 64
 	bitIdx := clusterIdx % 64
-
-	b.mu.RLock()
-	defer b.mu.RUnlock()
 	return (b.words[wordIdx] & (1 << bitIdx)) != 0
 }
 
@@ -166,15 +166,15 @@ func (b *freeClusterBitmap) countFree() uint64 {
 
 // grow expands the bitmap to track more clusters.
 func (b *freeClusterBitmap) grow(newNumClusters uint64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
 	if newNumClusters <= b.numClusters {
 		return
 	}
 
 	newNumWords := (newNumClusters + 63) / 64
 	oldNumWords := uint64(len(b.words))
-
-	b.mu.Lock()
-	defer b.mu.Unlock()
 
 	if newNumWords > oldNumWords {
 		newWords := make([]uint64, newNumWords)

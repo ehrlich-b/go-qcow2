@@ -764,13 +764,7 @@ func TestL2EntryFlagsIntegrity(t *testing.T) {
 
 // TestConcurrencyStress tests concurrent writes from multiple goroutines to
 // overlapping regions and verifies Check() reports no leaks or corruptions.
-//
-// NOTE: This test currently exposes concurrency bugs in the library's internal
-// structures (freeClusterBitmap, L2 cache, L2 table updates). These cause
-// refcount mismatches and leaked clusters under concurrent access.
-// Skipped until proper synchronization is implemented.
 func TestConcurrencyStress(t *testing.T) {
-	t.Skip("Skipping: known concurrency bugs cause refcount mismatches - see TODO.md")
 	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "concurrent.qcow2")
@@ -863,10 +857,7 @@ func TestConcurrencyStress(t *testing.T) {
 
 // TestConcurrencyMixedOperations tests concurrent mixed operations (read/write/zero)
 // from multiple goroutines.
-//
-// NOTE: This test currently exposes concurrency bugs. Skipped until fixed.
 func TestConcurrencyMixedOperations(t *testing.T) {
-	t.Skip("Skipping: known concurrency bugs cause refcount mismatches - see TODO.md")
 	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "mixed.qcow2")

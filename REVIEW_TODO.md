@@ -11,7 +11,7 @@
 - [x] Update persistent bitmaps on write or mark them inconsistent/in-use
 
 ## P1 / Confidence & Coverage
-- [x] Add concurrency stress test (many goroutines writing overlapping regions) - Tests added but **exposed real bugs**: race conditions cause refcount mismatches. Tests skipped until fixed. See TODO.md "Known Issues".
+- [x] Add concurrency stress test (many goroutines writing overlapping regions) - Tests pass with race detector after fixing synchronization issues.
 - [x] Add QEMU interop test for external-data images to confirm metadata placement and refcount accounting match QEMU's expectations.
 - [x] Add regression tests for compressed-cluster overwrite, ZeroAlloc overwrite, and extended-L2 write rejection/handling.
 
@@ -26,5 +26,5 @@ See `regression_test.go` for:
 - `TestMetadataAllocationInMainFile` - verifies metadata stays in main qcow2 file
 - `TestRefcountAfterManyAllocations` - stress test for refcount consistency
 - `TestL2EntryFlagsIntegrity` - verifies L2 entry flags across operations
-- `TestConcurrencyStress` - concurrent writes to overlapping regions (skipped - exposes bugs)
-- `TestConcurrencyMixedOperations` - concurrent read/write/zero operations (skipped - exposes bugs)
+- `TestConcurrencyStress` - concurrent writes to overlapping regions
+- `TestConcurrencyMixedOperations` - concurrent read/write/zero operations
