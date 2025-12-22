@@ -20,6 +20,7 @@ Test gaps identified during code review. Prioritized by criticality for producti
 | Snapshots | ✅ Good | `snapshot_test.go` |
 | External Data Files | ✅ Good | `external_data_test.go` |
 | Stress Tests | ✅ Good | `stress_test.go` |
+| **Code Coverage** | ⚠️ 70% | Target: 80% (full tests) |
 
 ### Test Phase 1: Critical (Before Any Production Use)
 
@@ -134,7 +135,7 @@ Test gaps identified during code review. Prioritized by criticality for producti
 - [x] `TestExternalDataFileGrowth` - Data file grows with writes
 - [x] `TestExternalDataFileWithCompression` - Should fail (incompatible)
 
-### Test Phase 3: Hardening
+### Test Phase 3: Hardening (Partial)
 
 #### 3.1 Stress / Longevity Tests
 
@@ -207,13 +208,13 @@ Test gaps identified during code review. Prioritized by criticality for producti
 
 ### Production Readiness Acceptance Criteria
 
-1. **All Phase 1 tests pass** - Crash recovery and corruption handling
-2. **All Phase 2 tests pass** - Boundary conditions and edge cases
-3. **24-hour fuzz test** - No crashes found
-4. **24-hour stress test** - No leaks, corruption, or errors
-5. **Race detector clean** - `go test -race` finds no issues
-6. **QEMU interop 100%** - All QEMU versions pass check
-7. **Code coverage > 80%** - Measured by `go test -cover`
+1. **All Phase 1 tests pass** - Crash recovery and corruption handling ✅
+2. **All Phase 2 tests pass** - Boundary conditions and edge cases ✅
+3. **24-hour fuzz test** - No crashes found ❌ (not yet run)
+4. **24-hour stress test** - No leaks, corruption, or errors ❌ (not yet run)
+5. **Race detector clean** - `go test -race` finds no issues ✅
+6. **QEMU interop 100%** - All QEMU versions pass check ✅
+7. **Code coverage > 80%** - Measured by `go test -cover` ❌ (currently ~70%)
 
 ---
 
@@ -359,10 +360,11 @@ Test gaps identified during code review. Prioritized by criticality for producti
 - [x] Implement encrypted cluster writes
 - [x] Handle IV generation for new clusters
 
-### Extended L2 Entries ✅
+### Extended L2 Entries (Read-Only) ✅
 - [x] Detect incompatible feature bit 4
 - [x] Parse 128-bit extended L2 entries
 - [x] 32 subclusters per cluster (read-only, test skipped if qemu < 5.2)
+- [ ] Write support for extended L2 images
 
 ### Bitmaps / Dirty Tracking ✅
 - [x] Bitmap extension parsing (0x23852875)

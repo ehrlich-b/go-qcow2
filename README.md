@@ -160,13 +160,14 @@ Comprehensive QCOW2 support with extensive testing against qemu-img.
 - [x] Compression (deflate + zstd)
 - [x] Encryption (legacy AES read-only, LUKS1/LUKS2 read/write)
 - [x] Snapshots (create, delete, revert, read)
-- [x] Extended L2 entries (32 subclusters)
+- [x] Extended L2 entries (read-only, 32 subclusters)
 - [x] External data files
 - [x] Dirty tracking bitmaps (incremental backup support)
 - [x] Zero clusters (space-efficient zeroing)
 - [x] Write ordering barriers (configurable safety levels)
 
 ### Not Yet Implemented
+- [ ] Extended L2 write support (currently read-only)
 - [ ] io_uring backend
 - [ ] Direct I/O (O_DIRECT)
 - [ ] go-ublk integration
